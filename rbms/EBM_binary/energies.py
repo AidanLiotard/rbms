@@ -28,10 +28,6 @@ class MLPEnergy(torch.nn.Module):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
 
-        if visible_field is None:
-            visible_field = torch.zeros(num_visibles)
-        self.visible_field = torch.nn.Parameter(torch.zeros_like(visible_field))
-
         layers = []
         in_dim = num_visibles
         for _ in range(num_layers):
@@ -42,8 +38,36 @@ class MLPEnergy(torch.nn.Module):
 
         self.net = torch.nn.Sequential(*layers)
 
+    @property
+    def visible_field(self) -> Tensor:
+        return self.compute_visible_field_from_formula()
+
     def forward(self, v: Tensor) -> Tensor:
-        return self.net(v).view(-1) - v @ self.visible_field
+        visible_field = self.compute_visible_field_from_formula()
+        return self.net(v).view(-1) - v @ visible_field
+
+    def compute_visible_field_from_formula(self) -> Tensor:
+        if self.num_layers != 1:
+            raise NotImplementedError(
+                "Differentiable formula visible_field is implemented only for one hidden layer."
+            )
+
+        W1 = self.net[0].weight
+        b1 = self.net[0].bias
+        activation = self.net[1]
+        W2 = self.net[2].weight.squeeze(0)
+
+        grad_enabled = torch.is_grad_enabled()
+        with torch.enable_grad():
+            phi_b1 = activation(b1)
+            phi_prime_b1 = torch.autograd.grad(
+                phi_b1.sum(),
+                b1,
+                create_graph=grad_enabled,
+                retain_graph=grad_enabled,
+            )[0]
+
+        return (W2 * phi_prime_b1) @ W1 / self.num_visibles
 
 
 def get_visible_field_from_data(
