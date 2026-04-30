@@ -342,7 +342,10 @@ class BEBM(EBM):
 
     def pre_grad_update(self) -> None: pass
 
-    def post_grad_update(self) -> None: pass
+    def post_grad_update(self) -> None: 
+        if hasattr(self.energy, "update_visible_field_from_formula"):
+            self.energy.update_visible_field_from_formula()
+
 
     @property
     def effective_number_variables(self) -> float: return self.num_visibles

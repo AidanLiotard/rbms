@@ -41,9 +41,28 @@ class MLPEnergy(torch.nn.Module):
         layers.append(torch.nn.Linear(in_dim, 1))
 
         self.net = torch.nn.Sequential(*layers)
+        self.update_visible_field_from_formula()
 
     def forward(self, v: Tensor) -> Tensor:
         return self.net(v).view(-1) - v @ self.visible_field
+    
+    @torch.no_grad()
+    def update_visible_field_from_formula(self) -> None:
+        if self.num_layers != 1:
+            raise NotImplementedError(
+                "Formula visible_field update is implemented only for one hidden layer."
+            )
+
+        W1 = self.net[0].weight
+        b1 = self.net[0].bias
+        activation = self.net[1]
+        W2 = self.net[2].weight.squeeze(0)
+
+        phi_b1 = activation(b1)
+        h = (W2 * phi_b1) @ W1 / self.num_visibles
+
+        self.visible_field.copy_(h)
+
 
 
 def get_visible_field_from_data(
