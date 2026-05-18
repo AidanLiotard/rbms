@@ -77,6 +77,17 @@ def add_args_init_rbm(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="(Defaults to 100). Number of hidden units.",
     )
     rbm_args.add_argument(
+        "--hidden_dims",
+        nargs="+",
+        type=int,
+        default=None,
+        help=(
+            "Hidden layer sizes for MLP energies. For example, "
+            "`--hidden_dims 512 256 128`. If omitted, defaults to "
+            "a single layer of size `num_hiddens`."
+        ),
+    )
+    rbm_args.add_argument(
         "--num_chains",
         type=int,
         default=None,
@@ -277,6 +288,7 @@ default_args: dict[str, Any] = {
     "log": True,
     "overwrite": True,
     "num_hiddens": 100,
+    "hidden_dims": None,
     "batch_size": 2000,
     "gibbs_steps": 100,
     "learning_rate": 0.01,

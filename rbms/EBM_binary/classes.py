@@ -1,16 +1,13 @@
 from __future__ import annotations
 
+import copy
+
 import numpy as np
 import torch
 from torch import Tensor
-import copy
 
-from rbms.EBM_binary.implement import (
-    _compute_energy_visibles,
-    _sample_state_dmala,
-    _init_chains,
-    _compute_gradient,
-    )
+from rbms.EBM_binary.energies import IndependentBernoulliEnergy, restore_energy
+from rbms.EBM_binary.implement import _sample_state_dmala
 
 from rbms.classes import EBM
 
@@ -85,12 +82,8 @@ class BEBM(EBM):
         Returns:
             Tensor: The computed energy.
         """
-        return _compute_energy_visibles(
-            energy=self.energy,
-            v=v,
-            device=self.device,
-            dtype=self.dtype,
-        )
+        v = v.to(device=self.device, dtype=self.dtype)
+        return self.energy(v).view(-1)
 
     def init_chains(
         self,
@@ -110,13 +103,27 @@ class BEBM(EBM):
         Notes:
             - If start_v is specified, its number of samples will override the num_samples argument.
         """
-        visible, mean_visible = _init_chains(
-            num_samples=num_samples,
-            num_visibles=self.num_visibles,
-            device=self.device,
-            dtype=self.dtype,
-            start_v=start_v,
-        )
+        if num_samples <= 0:
+            if start_v is not None:
+                num_samples = start_v.shape[0]
+            else:
+                raise ValueError(f"Got negative num_samples arg: {num_samples}")
+
+        if start_v is None:
+            mean_visible = (
+                torch.ones(
+                    size=(num_samples, self.num_visibles),
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                / 2
+            )
+            visible = torch.bernoulli(mean_visible)
+        else:
+            mean_visible = (
+                torch.ones_like(start_v, device=self.device, dtype=self.dtype) / 2
+            )
+            visible = start_v.to(device=self.device, dtype=self.dtype)
 
         if weights is None:
             weights = torch.ones(
@@ -146,16 +153,23 @@ class BEBM(EBM):
             chains (dict[str, Tensor]): The parallel chains used for gradient computation.
             centered (bool, optional): Whether to use centered gradients. Defaults to True.
         """
-        return _compute_gradient(
-            energy=self.energy,
-            v_data=data["visible"],
-            w_data=data["weights"],
-            v_chain=chains["visible"],
-            w_chain=chains["weights"],
-            device=self.device,
-            dtype=self.dtype,
-            centered=centered,
-        )
+        v_data = data["visible"].to(device=self.device, dtype=self.dtype)
+        v_chain = chains["visible"].to(device=self.device, dtype=self.dtype)
+        w_data = data["weights"].to(device=self.device, dtype=self.dtype).view(-1)
+        w_chain = chains["weights"].to(device=self.device, dtype=self.dtype).view(-1)
+
+        data_weights = w_data / w_data.sum()
+        chain_weights = w_chain / w_chain.sum()
+
+        data_energy = self.energy(v_data).view(-1)
+        chain_energy = self.energy(v_chain).view(-1)
+
+        objective = -(data_energy * data_weights).sum() + (
+            chain_energy * chain_weights
+        ).sum()
+
+        self.energy.zero_grad(set_to_none=True)
+        objective.backward()
 
     def parameters(self) -> list[Tensor]:
         """Returns a list containing the parameters of the BEBM.
@@ -177,8 +191,6 @@ class BEBM(EBM):
         device: torch.device | str,
         dtype: torch.dtype,
     ) -> EBM:
-        from rbms.EBM_binary.energies import restore_energy
-
         energy = restore_energy(
             named_params=named_params,
             device=device,
@@ -272,8 +284,6 @@ class BEBM(EBM):
     
     def independent_model(self) -> EBM:
         """Independent model where only local fields are preserved."""
-        from rbms.EBM_binary.energies import IndependentBernoulliEnergy
-
         energy = IndependentBernoulliEnergy(
             visible_field=self.energy.visible_field.detach().clone()
         )
@@ -331,13 +341,6 @@ class BEBM(EBM):
             case _:
                 raise NotImplementedError(f"Seulement dmala as of now.")
 
-    def sample_visibles(
-            self, 
-            chains, 
-            beta = 1.0
-        ) -> dict[str, Tensor]:
-        raise NotImplementedError("Sampling visibles is not implemented yet.")
-        
     def get_metrics(self, metrics: dict[str, float]) -> dict[str, float]: return metrics
 
     def pre_grad_update(self) -> None: pass

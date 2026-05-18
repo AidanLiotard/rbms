@@ -5,6 +5,21 @@ import torch
 from torch import Tensor
 
 
+def _normalize_hidden_dims(
+    hidden_dims: list[int] | tuple[int, ...] | None = None,
+    hidden_dim: int = 256,
+    num_layers: int = 1,
+) -> list[int]:
+    if hidden_dims is None:
+        hidden_dims = [hidden_dim] * num_layers
+    hidden_dims = [int(dim) for dim in hidden_dims]
+    if len(hidden_dims) == 0:
+        raise ValueError("hidden_dims must contain at least one hidden layer size.")
+    if any(dim <= 0 for dim in hidden_dims):
+        raise ValueError(f"hidden_dims must be positive, got {hidden_dims}.")
+    return hidden_dims
+
+
 class MLPEnergy(torch.nn.Module):
     """Binary visible-state energy represented by an MLP.
 
@@ -19,6 +34,7 @@ class MLPEnergy(torch.nn.Module):
     def __init__(
         self,
         num_visibles: int,
+        hidden_dims: list[int] | tuple[int, ...] | None = None,
         hidden_dim: int = 256,
         num_layers: int = 1,
         visible_field: Tensor | None = None,
@@ -26,8 +42,13 @@ class MLPEnergy(torch.nn.Module):
     ):
         super().__init__()
         self.num_visibles = num_visibles
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
+        self.hidden_dims = _normalize_hidden_dims(
+            hidden_dims=hidden_dims,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+        )
+        self.hidden_dim = self.hidden_dims[-1]
+        self.num_layers = len(self.hidden_dims)
 
         if visible_field is None:
             visible_field = torch.zeros(num_visibles)
@@ -35,10 +56,10 @@ class MLPEnergy(torch.nn.Module):
 
         layers = []
         in_dim = num_visibles
-        for _ in range(num_layers):
-            layers.append(torch.nn.Linear(in_dim, hidden_dim))
+        for out_dim in self.hidden_dims:
+            layers.append(torch.nn.Linear(in_dim, out_dim))
             layers.append(torch.nn.SiLU())
-            in_dim = hidden_dim
+            in_dim = out_dim
         layers.append(torch.nn.Linear(in_dim, 1))
 
         self.net = torch.nn.Sequential(*layers)
@@ -56,6 +77,7 @@ class MLPNoW2Energy(torch.nn.Module):
     def __init__(
         self,
         num_visibles: int,
+        hidden_dims: list[int] | tuple[int, ...] | None = None,
         hidden_dim: int = 256,
         num_layers: int = 1,
         visible_field: Tensor | None = None,
@@ -66,9 +88,16 @@ class MLPNoW2Energy(torch.nn.Module):
     ):
         super().__init__()
         self.num_visibles = num_visibles
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
-        self.output_scale = hidden_dim**-0.5 if output_scale is None else output_scale
+        self.hidden_dims = _normalize_hidden_dims(
+            hidden_dims=hidden_dims,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+        )
+        self.hidden_dim = self.hidden_dims[-1]
+        self.num_layers = len(self.hidden_dims)
+        self.output_scale = (
+            self.hidden_dims[-1] ** -0.5 if output_scale is None else output_scale
+        )
         self.register_buffer("activation_id", torch.tensor(activation_id))
 
         if visible_field is None:
@@ -77,10 +106,10 @@ class MLPNoW2Energy(torch.nn.Module):
 
         layers = []
         in_dim = num_visibles
-        for _ in range(num_layers):
-            layers.append(torch.nn.Linear(in_dim, hidden_dim))
+        for out_dim in self.hidden_dims:
+            layers.append(torch.nn.Linear(in_dim, out_dim))
             layers.append(activation())
-            in_dim = hidden_dim
+            in_dim = out_dim
 
         self.net = torch.nn.Sequential(*layers)
 
@@ -297,13 +326,11 @@ def restore_mlp_energy(
 
     first_weight = named_params[weight_keys[0]]
     num_visibles = first_weight.shape[1]
-    hidden_dim = first_weight.shape[0]
-    num_layers = len(weight_keys) - 1
+    hidden_dims = [named_params[key].shape[0] for key in weight_keys[:-1]]
 
     return MLPEnergy(
         num_visibles=num_visibles,
-        hidden_dim=hidden_dim,
-        num_layers=num_layers,
+        hidden_dims=hidden_dims,
     )
 
 
@@ -321,14 +348,12 @@ def restore_mlp_no_w2_energy(
 
     first_weight = named_params[weight_keys[0]]
     num_visibles = first_weight.shape[1]
-    hidden_dim = first_weight.shape[0]
-    num_layers = len(weight_keys)
+    hidden_dims = [named_params[key].shape[0] for key in weight_keys]
 
     energy_class = ENERGY_MAP[energy_type]
     return energy_class(
         num_visibles=num_visibles,
-        hidden_dim=hidden_dim,
-        num_layers=num_layers,
+        hidden_dims=hidden_dims,
     )
 
 

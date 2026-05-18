@@ -5,6 +5,21 @@ import torch
 from torch import Tensor
 
 
+def _normalize_hidden_dims(
+    hidden_dims: list[int] | tuple[int, ...] | None = None,
+    hidden_dim: int = 256,
+    num_layers: int = 1,
+) -> list[int]:
+    if hidden_dims is None:
+        hidden_dims = [hidden_dim] * num_layers
+    hidden_dims = [int(dim) for dim in hidden_dims]
+    if len(hidden_dims) == 0:
+        raise ValueError("hidden_dims must contain at least one hidden layer size.")
+    if any(dim <= 0 for dim in hidden_dims):
+        raise ValueError(f"hidden_dims must be positive, got {hidden_dims}.")
+    return hidden_dims
+
+
 class GaussianBaseEnergy(torch.nn.Module):
     """Independent Gaussian reference energy for continuous visibles."""
 
@@ -32,6 +47,7 @@ class MLPEnergy(torch.nn.Module):
     def __init__(
         self,
         num_visibles: int,
+        hidden_dims: list[int] | tuple[int, ...] | None = None,
         hidden_dim: int = 256,
         num_layers: int = 1,
         data_mean: Tensor | None = None,
@@ -39,8 +55,13 @@ class MLPEnergy(torch.nn.Module):
     ):
         super().__init__()
         self.num_visibles = num_visibles
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
+        self.hidden_dims = _normalize_hidden_dims(
+            hidden_dims=hidden_dims,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+        )
+        self.hidden_dim = self.hidden_dims[-1]
+        self.num_layers = len(self.hidden_dims)
 
         if data_mean is None:
             data_mean = torch.zeros(num_visibles)
@@ -51,10 +72,10 @@ class MLPEnergy(torch.nn.Module):
 
         layers = []
         in_dim = num_visibles
-        for _ in range(num_layers):
-            layers.append(torch.nn.Linear(in_dim, hidden_dim))
+        for out_dim in self.hidden_dims:
+            layers.append(torch.nn.Linear(in_dim, out_dim))
             layers.append(torch.nn.SiLU())
-            in_dim = hidden_dim
+            in_dim = out_dim
         layers.append(torch.nn.Linear(in_dim, 1))
 
         self.net = torch.nn.Sequential(*layers)
@@ -172,13 +193,11 @@ def restore_mlp_energy(named_params: dict[str, np.ndarray]) -> MLPEnergy:
 
     first_weight = named_params[weight_keys[0]]
     num_visibles = first_weight.shape[1]
-    hidden_dim = first_weight.shape[0]
-    num_layers = len(weight_keys) - 1
+    hidden_dims = [named_params[key].shape[0] for key in weight_keys[:-1]]
 
     return MLPEnergy(
         num_visibles=num_visibles,
-        hidden_dim=hidden_dim,
-        num_layers=num_layers,
+        hidden_dims=hidden_dims,
         data_mean=torch.as_tensor(named_params["base.data_mean"]),
         data_std=torch.as_tensor(named_params["base.data_std"]),
     )

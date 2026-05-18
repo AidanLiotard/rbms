@@ -7,12 +7,7 @@ import torch
 from torch import Tensor
 
 from rbms.classes import EBM
-from rbms.EBM_continuous.implement import (
-    _compute_energy_visibles,
-    _compute_gradient,
-    _init_chains,
-    _sample_state_hmc,
-)
+from rbms.EBM_continuous.implement import _sample_state_hmc
 
 
 class CEBM(EBM):
@@ -61,12 +56,8 @@ class CEBM(EBM):
         return True
 
     def compute_energy_visibles(self, v: Tensor) -> Tensor:
-        return _compute_energy_visibles(
-            energy=self.energy,
-            v=v,
-            device=self.device,
-            dtype=self.dtype,
-        )
+        v = v.to(device=self.device, dtype=self.dtype)
+        return self.energy(v).view(-1)
 
     def init_chains(
         self,
@@ -75,15 +66,21 @@ class CEBM(EBM):
         start_v: Tensor | None = None,
     ) -> dict[str, Tensor]:
         data_mean, data_std = self._get_base_stats()
-        visible, mean_visible = _init_chains(
-            num_samples=num_samples,
-            num_visibles=self.num_visibles,
-            device=self.device,
-            dtype=self.dtype,
-            data_mean=data_mean,
-            data_std=data_std,
-            start_v=start_v,
-        )
+        if num_samples <= 0:
+            if start_v is not None:
+                num_samples = start_v.shape[0]
+            else:
+                raise ValueError(f"Got negative num_samples arg: {num_samples}")
+
+        if start_v is None:
+            visible = data_mean.view(1, -1) + data_std.view(1, -1) * torch.randn(
+                size=(num_samples, self.num_visibles),
+                device=self.device,
+                dtype=self.dtype,
+            )
+        else:
+            visible = start_v.to(device=self.device, dtype=self.dtype)
+        mean_visible = visible
 
         if weights is None:
             weights = torch.ones(
@@ -106,16 +103,23 @@ class CEBM(EBM):
         chains: dict[str, Tensor],
         centered: bool = True,
     ) -> None:
-        return _compute_gradient(
-            energy=self.energy,
-            v_data=data["visible"],
-            w_data=data["weights"],
-            v_chain=chains["visible"],
-            w_chain=chains["weights"],
-            device=self.device,
-            dtype=self.dtype,
-            centered=centered,
-        )
+        v_data = data["visible"].to(device=self.device, dtype=self.dtype)
+        v_chain = chains["visible"].to(device=self.device, dtype=self.dtype)
+        w_data = data["weights"].to(device=self.device, dtype=self.dtype).view(-1)
+        w_chain = chains["weights"].to(device=self.device, dtype=self.dtype).view(-1)
+
+        data_weights = w_data / w_data.sum()
+        chain_weights = w_chain / w_chain.sum()
+
+        data_energy = self.energy(v_data).view(-1)
+        chain_energy = self.energy(v_chain).view(-1)
+
+        objective = -(data_energy * data_weights).sum() + (
+            chain_energy * chain_weights
+        ).sum()
+
+        self.energy.zero_grad(set_to_none=True)
+        objective.backward()
 
     def parameters(self) -> list[Tensor]:
         return list(self.energy.parameters())
@@ -226,6 +230,18 @@ class CEBM(EBM):
         beta: float = 1.0,
         **kwargs,
     ) -> dict[str, Tensor]:
+        """Sample the model for n_steps.
+
+        Args:
+            chains: The starting position of the chains.
+            n_steps: The number of sampling steps.
+            beta: The inverse temperature. Defaults to 1.0.
+            kernel: The Markov kernel to use for sampling. Defaults to "hmc".
+            kernel_params: Parameters forwarded to the Markov kernel.
+
+        Returns:
+            The updated chains after n_steps of sampling.
+        """
         kernel: str | None = kwargs.pop("kernel", None)
         kernel_params: dict | None = kwargs.pop("kernel_params", {})
 
@@ -252,9 +268,6 @@ class CEBM(EBM):
                 )
             case _:
                 raise NotImplementedError(f"Unknown CEBM sampling kernel: {kernel}.")
-
-    def sample_visibles(self, chains, beta=1.0) -> dict[str, Tensor]:
-        return self.sample_state(chains=chains, n_steps=1, beta=beta)
 
     def get_metrics(self, metrics: dict[str, float]) -> dict[str, float]:
         return metrics

@@ -169,6 +169,10 @@ notebooks/.ipynb_checkpoints
 notebooks/*
 src/
 **/__pycache__/
+**/.DS_store
+**/.DS_Store
+**/*.ipynb
+**/*.json
 **/*.csv
 **/*.h5
 **/*.fasta

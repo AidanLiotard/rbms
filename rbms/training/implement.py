@@ -22,6 +22,7 @@ def _init_training(
     train_size: float,
     test_size: float,
     num_hiddens: int,
+    hidden_dims: list[int] | None,
     num_chains: int,
     model_type: str,
     energy_type: str,
@@ -66,6 +67,9 @@ def _init_training(
     num_visibles = train_dataset.get_num_visibles()
 
     # Setup model
+    if hidden_dims is None:
+        hidden_dims = [num_hiddens]
+
     if model_type == "BEBM":
         visible_field = get_visible_field_from_data(
             data=train_dataset.data,
@@ -79,7 +83,7 @@ def _init_training(
                     num_visibles=num_visibles,
                     device=device,
                     dtype=dtype,
-                    hidden_dim=num_hiddens,
+                    hidden_dims=hidden_dims,
                     visible_field=visible_field,
                 )
 
@@ -116,7 +120,7 @@ def _init_training(
                     num_visibles=num_visibles,
                     device=device,
                     dtype=dtype,
-                    hidden_dim=num_hiddens,
+                    hidden_dims=hidden_dims,
                     data_mean=data_mean,
                     data_std=data_std,
                 )
@@ -163,6 +167,7 @@ def _init_training(
         hyperparameters = file_model.create_group("hyperparameters")
         hyperparameters["num_visibles"] = num_visibles
         hyperparameters["num_hiddens"] = num_hiddens
+        hyperparameters["hidden_dims"] = hidden_dims
         hyperparameters["num_chains"] = num_chains
         hyperparameters["filename"] = str(filename)
         hyperparameters["energy_type"] = np.asarray(energy_type, dtype="T")

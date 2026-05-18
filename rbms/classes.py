@@ -191,21 +191,6 @@ class EBM(ABC):
         """Independent model where only local fields are preserved."""
 
     @abstractmethod
-    def sample_visibles(
-        self, chains: dict[str, Tensor], beta: float = 1.0
-    ) -> dict[str, Tensor]:
-        """Sample the visible layer.
-
-        Args:
-            chains (dict[str, Tensor]): The parallel chains used for sampling.
-            beta (float, optional): The inverse temperature. Defaults to 1.0.
-
-        Returns:
-            dict[str, Tensor]: The updated chains with sampled hidden states.
-        """
-        ...
-
-    @abstractmethod
     def sample_state(
         self, chains: dict[str, Tensor], n_steps: int, beta: float = 1.0, **kwargs
     ) -> dict[str, Tensor]:
@@ -215,8 +200,6 @@ class EBM(ABC):
             chains (): The starting position of the chains.
             n_steps (int): The number of sampling steps.
             beta (float, optional): The inverse temperature. Defaults to 1.0
-            kernel (Optional[Kernel]): The Markov kernel to use for sampling. Defaults to None.
-            kernel_params (Optional[dict]): The parameters for the Markov kernel. Defaults to None.
 
         Returns:
             dict[str, Tensor]: The updated chains after n_steps of sampling.
@@ -303,6 +286,21 @@ class RBM(EBM):
 
         Args:
             h (Tensor): The computed energy
+        """
+        ...
+
+    @abstractmethod
+    def sample_visibles(
+        self, chains: dict[str, Tensor], beta: float = 1.0
+    ) -> dict[str, Tensor]:
+        """Sample the visible layer conditionally to the hidden one.
+
+        Args:
+            chains (dict[str, Tensor]): The parallel chains used for sampling.
+            beta (float, optional): The inverse temperature. Defaults to 1.0.
+
+        Returns:
+            dict[str, Tensor]: The updated chains with sampled visible states.
         """
         ...
 

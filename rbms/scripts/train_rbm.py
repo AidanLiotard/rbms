@@ -64,6 +64,7 @@ def main(args, map_model=map_model):
             train_size=args["train_size"],
             test_size=1 - args["train_size"],
             num_hiddens=args["num_hiddens"],
+            hidden_dims=args["hidden_dims"],
             num_chains=args["num_chains"],
             model_type=args["model_type"],
             filename=args["filename"],
