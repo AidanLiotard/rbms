@@ -64,11 +64,6 @@ class MLPEnergy(torch.nn.Module):
 
         self.net = torch.nn.Sequential(*layers)
 
-        for module in self.net:
-            if isinstance(module, torch.nn.Linear):
-                torch.nn.init.normal_(module.weight, mean=0.0, std=weight_scale)
-                torch.nn.init.zeros_(module.bias)
-
     def forward(self, v: Tensor) -> Tensor:
         return self.net(v).view(-1) - v @ self.visible_field
 
