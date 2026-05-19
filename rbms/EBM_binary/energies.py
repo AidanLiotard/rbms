@@ -4,6 +4,157 @@ import numpy as np
 import torch
 from torch import Tensor
 
+def build_energy(
+    energy_type: str,
+    num_visibles: int,
+    device: torch.device | str,
+    dtype: torch.dtype,
+    **energy_kwargs,
+) -> torch.nn.Module:
+    if energy_type not in ENERGY_MAP:
+        raise ValueError(
+            f"Unknown energy type '{energy_type}'. "
+            f"Available energy types: {list(ENERGY_MAP.keys())}."
+        )
+
+    energy = ENERGY_MAP[energy_type](
+        num_visibles=num_visibles,
+        **energy_kwargs,
+    )
+    return energy.to(device=device, dtype=dtype)
+
+def restore_energy(
+    named_params: dict[str, np.ndarray],
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> torch.nn.Module:
+    """Restore an energy module from saved parameter arrays.
+
+    The HDF5 archive stores only the energy state_dict. This function identifies
+    which energy class produced that state_dict, rebuilds the module, and loads
+    the saved tensors.
+    """
+
+    energy_type = identify_energy_type(named_params)
+
+    match energy_type:
+        case "rbm":
+            energy = restore_rbm_energy(named_params)
+
+        case "mlp":
+            energy = restore_mlp_energy(named_params)
+
+        case "mlp_no_w2" | "mlp_silu_no_w2" | "mlp_sigmoid_no_w2":
+            energy = restore_mlp_no_w2_energy(named_params, energy_type)
+
+        case _:
+            raise ValueError(
+                f"Cannot restore unknown energy type '{energy_type}'. "
+                f"Available parameter keys: {list(named_params.keys())}."
+            )
+
+    state_dict = {
+        name: torch.as_tensor(array, device=device, dtype=dtype)
+        for name, array in named_params.items()
+    }
+    if "visible_field" in energy.state_dict() and "visible_field" not in state_dict:
+        state_dict["visible_field"] = torch.zeros(
+            energy.num_visibles,
+            device=device,
+            dtype=dtype,
+        )
+    if "activation_id" in energy.state_dict() and "activation_id" not in state_dict:
+        state_dict["activation_id"] = energy.state_dict()["activation_id"]
+
+    energy.load_state_dict(state_dict)
+    return energy.to(device=device, dtype=dtype)
+
+def identify_energy_type(named_params: dict[str, np.ndarray]) -> str:
+    """Infer the energy type from the state_dict keys."""
+
+    keys = set(named_params)
+
+    match keys:
+        case keys if {"weight", "vbias", "hbias"} <= keys:
+            return "rbm"
+
+        case keys if any(name.startswith("net.") for name in keys):
+            weight_keys = sorted(
+                [name for name in keys if name.endswith(".weight")],
+                key=lambda name: int(name.split(".")[1]),
+            )
+            if named_params[weight_keys[-1]].shape[0] == 1:
+                return "mlp"
+            if "activation_id" in named_params:
+                if int(named_params["activation_id"]) == 0:
+                    return "mlp_silu_no_w2"
+                return "mlp_sigmoid_no_w2"
+            return "mlp_no_w2"
+
+        case _:
+            raise ValueError(
+                "Could not identify BEBM energy type from saved parameters. "
+                f"Available keys: {list(named_params.keys())}."
+            )
+
+
+def restore_rbm_energy(
+    named_params: dict[str, np.ndarray],
+) -> RBMEnergy:
+    """Rebuild an RBMEnergy from its saved parameter shapes."""
+
+    num_visibles, hidden_dim = named_params["weight"].shape
+
+    return RBMEnergy(
+        num_visibles=num_visibles,
+        hidden_dim=hidden_dim,
+    )
+
+def restore_mlp_energy(
+    named_params: dict[str, np.ndarray],
+) -> MLPEnergy:
+    """Rebuild an MLPEnergy from its saved parameter shapes."""
+
+    weight_keys = sorted(
+        [name for name in named_params if name.endswith(".weight")],
+        key=lambda name: int(name.split(".")[1]),
+    )
+
+    if len(weight_keys) == 0:
+        raise ValueError("Cannot restore MLPEnergy without weight tensors.")
+
+    first_weight = named_params[weight_keys[0]]
+    num_visibles = first_weight.shape[1]
+    hidden_dims = [named_params[key].shape[0] for key in weight_keys[:-1]]
+    final_bias_key = weight_keys[-1].replace(".weight", ".bias")
+
+    return MLPEnergy(
+        num_visibles=num_visibles,
+        hidden_dims=hidden_dims,
+        output_bias=final_bias_key in named_params,
+    )
+
+def restore_mlp_no_w2_energy(
+    named_params: dict[str, np.ndarray],
+    energy_type: str = "mlp_no_w2",
+) -> MLPNoW2Energy:
+    weight_keys = sorted(
+        [name for name in named_params if name.endswith(".weight")],
+        key=lambda name: int(name.split(".")[1]),
+    )
+
+    if len(weight_keys) == 0:
+        raise ValueError("Cannot restore MLPNoW2Energy without weight tensors.")
+
+    first_weight = named_params[weight_keys[0]]
+    num_visibles = first_weight.shape[1]
+    hidden_dims = [named_params[key].shape[0] for key in weight_keys]
+
+    energy_class = ENERGY_MAP[energy_type]
+    return energy_class(
+        num_visibles=num_visibles,
+        hidden_dims=hidden_dims,
+    )
 
 def _normalize_hidden_dims(
     hidden_dims: list[int] | tuple[int, ...] | None = None,
@@ -19,7 +170,6 @@ def _normalize_hidden_dims(
         raise ValueError(f"hidden_dims must be positive, got {hidden_dims}.")
     return hidden_dims
 
-
 def _init_mlp_layers(
     modules: torch.nn.Sequential,
 ) -> None:
@@ -30,7 +180,6 @@ def _init_mlp_layers(
             torch.nn.init.xavier_uniform_(module.weight)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
-
 
 def _rescale_final_linear_to_target_std(
     modules: torch.nn.Sequential,
@@ -77,6 +226,22 @@ def _rescale_final_linear_to_target_std(
             return float(scale.detach().cpu())
 
     return 1.0
+
+def get_visible_field_from_data(
+    data: Tensor,
+    weights: Tensor | None = None,
+    eps: float = 1e-4,
+) -> Tensor:
+    """Return h_i = log(p_i / (1 - p_i)) for binary variables v_i in {0, 1}."""
+
+    if weights is None:
+        p = data.mean(dim=0)
+    else:
+        weights = weights.to(device=data.device, dtype=data.dtype).view(-1)
+        p = (data * weights[:, None]).sum(dim=0) / weights.sum()
+
+    p = p.clamp(min=eps, max=1.0 - eps)
+    return torch.log(p) - torch.log1p(-p)
 
 
 class MLPEnergy(torch.nn.Module):
@@ -194,29 +359,22 @@ class MLPNoW2Energy(torch.nn.Module):
 
 class MLPSiLUNoW2Energy(MLPNoW2Energy):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, activation=torch.nn.SiLU, activation_id=0, **kwargs)
+        super().__init__(
+            *args,
+            activation=torch.nn.SiLU,
+            activation_id=0,
+            **kwargs,
+        )
 
 
 class MLPSigmoidNoW2Energy(MLPNoW2Energy):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, activation=torch.nn.Sigmoid, activation_id=1, **kwargs)
-
-
-def get_visible_field_from_data(
-    data: Tensor,
-    weights: Tensor | None = None,
-    eps: float = 1e-4,
-) -> Tensor:
-    """Return h_i = log(p_i / (1 - p_i)) for binary variables v_i in {0, 1}."""
-
-    if weights is None:
-        p = data.mean(dim=0)
-    else:
-        weights = weights.to(device=data.device, dtype=data.dtype).view(-1)
-        p = (data * weights[:, None]).sum(dim=0) / weights.sum()
-
-    p = p.clamp(min=eps, max=1.0 - eps)
-    return torch.log(p) - torch.log1p(-p)
+        super().__init__(
+            *args,
+            activation=torch.nn.Sigmoid,
+            activation_id=1,
+            **kwargs,
+        )
 
 
 class RBMEnergy(torch.nn.Module):
@@ -263,172 +421,6 @@ class RBMEnergy(torch.nn.Module):
         return -visible_term - hidden_term
 
 
-ENERGY_MAP: dict[str, type[torch.nn.Module]] = {
-    "mlp": MLPEnergy,
-    "mlp_no_w2": MLPSigmoidNoW2Energy,
-    "mlp_silu_no_w2": MLPSiLUNoW2Energy,
-    "mlp_sigmoid_no_w2": MLPSigmoidNoW2Energy,
-    "rbm": RBMEnergy,
-}
-
-
-def build_energy(
-    energy_type: str,
-    num_visibles: int,
-    device: torch.device | str,
-    dtype: torch.dtype,
-    **energy_kwargs,
-) -> torch.nn.Module:
-    if energy_type not in ENERGY_MAP:
-        raise ValueError(
-            f"Unknown energy type '{energy_type}'. "
-            f"Available energy types: {list(ENERGY_MAP.keys())}."
-        )
-
-    energy = ENERGY_MAP[energy_type](
-        num_visibles=num_visibles,
-        **energy_kwargs,
-    )
-    return energy.to(device=device, dtype=dtype)
-
-
-def restore_energy(
-    named_params: dict[str, np.ndarray],
-    device: torch.device | str,
-    dtype: torch.dtype,
-) -> torch.nn.Module:
-    """Restore an energy module from saved parameter arrays.
-
-    The HDF5 archive stores only the energy state_dict. This function identifies
-    which energy class produced that state_dict, rebuilds the module, and loads
-    the saved tensors.
-    """
-
-    energy_type = identify_energy_type(named_params)
-
-    match energy_type:
-        case "rbm":
-            energy = restore_rbm_energy(named_params)
-
-        case "mlp":
-            energy = restore_mlp_energy(named_params)
-
-        case "mlp_no_w2" | "mlp_silu_no_w2" | "mlp_sigmoid_no_w2":
-            energy = restore_mlp_no_w2_energy(named_params, energy_type)
-
-        case _:
-            raise ValueError(
-                f"Cannot restore unknown energy type '{energy_type}'. "
-                f"Available parameter keys: {list(named_params.keys())}."
-            )
-
-    state_dict = {
-        name: torch.as_tensor(array, device=device, dtype=dtype)
-        for name, array in named_params.items()
-    }
-    if "visible_field" in energy.state_dict() and "visible_field" not in state_dict:
-        state_dict["visible_field"] = torch.zeros(
-            energy.num_visibles,
-            device=device,
-            dtype=dtype,
-        )
-    if "activation_id" in energy.state_dict() and "activation_id" not in state_dict:
-        state_dict["activation_id"] = energy.state_dict()["activation_id"]
-
-    energy.load_state_dict(state_dict)
-    return energy.to(device=device, dtype=dtype)
-
-
-def identify_energy_type(named_params: dict[str, np.ndarray]) -> str:
-    """Infer the energy type from the state_dict keys."""
-
-    keys = set(named_params)
-
-    match keys:
-        case keys if {"weight", "vbias", "hbias"} <= keys:
-            return "rbm"
-
-        case keys if any(name.startswith("net.") for name in keys):
-            weight_keys = sorted(
-                [name for name in keys if name.endswith(".weight")],
-                key=lambda name: int(name.split(".")[1]),
-            )
-            if named_params[weight_keys[-1]].shape[0] == 1:
-                return "mlp"
-            if "activation_id" in named_params:
-                if int(named_params["activation_id"]) == 0:
-                    return "mlp_silu_no_w2"
-                return "mlp_sigmoid_no_w2"
-            return "mlp_no_w2"
-
-        case _:
-            raise ValueError(
-                "Could not identify BEBM energy type from saved parameters. "
-                f"Available keys: {list(named_params.keys())}."
-            )
-
-
-def restore_rbm_energy(
-    named_params: dict[str, np.ndarray],
-) -> RBMEnergy:
-    """Rebuild an RBMEnergy from its saved parameter shapes."""
-
-    num_visibles, hidden_dim = named_params["weight"].shape
-
-    return RBMEnergy(
-        num_visibles=num_visibles,
-        hidden_dim=hidden_dim,
-    )
-
-
-def restore_mlp_energy(
-    named_params: dict[str, np.ndarray],
-) -> MLPEnergy:
-    """Rebuild an MLPEnergy from its saved parameter shapes."""
-
-    weight_keys = sorted(
-        [name for name in named_params if name.endswith(".weight")],
-        key=lambda name: int(name.split(".")[1]),
-    )
-
-    if len(weight_keys) == 0:
-        raise ValueError("Cannot restore MLPEnergy without weight tensors.")
-
-    first_weight = named_params[weight_keys[0]]
-    num_visibles = first_weight.shape[1]
-    hidden_dims = [named_params[key].shape[0] for key in weight_keys[:-1]]
-    final_bias_key = weight_keys[-1].replace(".weight", ".bias")
-
-    return MLPEnergy(
-        num_visibles=num_visibles,
-        hidden_dims=hidden_dims,
-        output_bias=final_bias_key in named_params,
-    )
-
-
-def restore_mlp_no_w2_energy(
-    named_params: dict[str, np.ndarray],
-    energy_type: str = "mlp_no_w2",
-) -> MLPNoW2Energy:
-    weight_keys = sorted(
-        [name for name in named_params if name.endswith(".weight")],
-        key=lambda name: int(name.split(".")[1]),
-    )
-
-    if len(weight_keys) == 0:
-        raise ValueError("Cannot restore MLPNoW2Energy without weight tensors.")
-
-    first_weight = named_params[weight_keys[0]]
-    num_visibles = first_weight.shape[1]
-    hidden_dims = [named_params[key].shape[0] for key in weight_keys]
-
-    energy_class = ENERGY_MAP[energy_type]
-    return energy_class(
-        num_visibles=num_visibles,
-        hidden_dims=hidden_dims,
-    )
-
-
 class IndependentBernoulliEnergy(torch.nn.Module):
     """Independent Bernoulli visible energy.
 
@@ -444,7 +436,6 @@ class IndependentBernoulliEnergy(torch.nn.Module):
 
     def forward(self, v: Tensor) -> Tensor:
         return -v @ self.visible_field
-
 
 
 class InterpolatedEnergy(torch.nn.Module):
@@ -471,3 +462,12 @@ class InterpolatedEnergy(torch.nn.Module):
 
     def forward(self, v: Tensor) -> Tensor:
         return (1.0 - self.beta) * self.energy_0(v) + self.beta * self.energy_1(v)
+
+
+ENERGY_MAP: dict[str, type[torch.nn.Module]] = {
+    "mlp": MLPEnergy,
+    "mlp_no_w2": MLPSigmoidNoW2Energy,
+    "mlp_silu_no_w2": MLPSiLUNoW2Energy,
+    "mlp_sigmoid_no_w2": MLPSigmoidNoW2Energy,
+    "rbm": RBMEnergy,
+}
