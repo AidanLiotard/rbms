@@ -20,6 +20,65 @@ def _normalize_hidden_dims(
     return hidden_dims
 
 
+def _init_mlp_layers(
+    modules: torch.nn.Sequential,
+) -> None:
+    """Initialize MLP weights while keeping hidden biases neutral."""
+
+    for module in modules:
+        if isinstance(module, torch.nn.Linear):
+            torch.nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+
+
+def _rescale_final_linear_to_target_std(
+    modules: torch.nn.Sequential,
+    data: Tensor,
+    target_std: float = 0.05,
+    weights: Tensor | None = None,
+    batch_size: int = 4096,
+    eps: float = 1e-12,
+) -> float:
+    """Rescale only the final Linear layer so Std_D(f_theta(x)) ~= target_std."""
+
+    linear_layers = [module for module in modules if isinstance(module, torch.nn.Linear)]
+    if len(linear_layers) == 0:
+        raise ValueError("Cannot calibrate an MLP without Linear layers.")
+
+    final_layer = linear_layers[-1]
+    device = final_layer.weight.device
+    dtype = final_layer.weight.dtype
+    data = data.to(device=device, dtype=dtype)
+    if weights is not None:
+        weights = weights.to(device=device, dtype=dtype).view(-1)
+
+    outputs = []
+    weight_chunks = []
+    with torch.no_grad():
+        for start in range(0, data.shape[0], batch_size):
+            stop = min(start + batch_size, data.shape[0])
+            outputs.append(modules(data[start:stop]).view(-1))
+            if weights is not None:
+                weight_chunks.append(weights[start:stop])
+
+        values = torch.cat(outputs)
+        if weights is None:
+            current_std = values.std(unbiased=False)
+        else:
+            sample_weights = torch.cat(weight_chunks)
+            norm_weights = sample_weights / sample_weights.sum()
+            mean = (values * norm_weights).sum()
+            current_std = ((values - mean).square() * norm_weights).sum().sqrt()
+
+        if torch.isfinite(current_std) and current_std > eps:
+            scale = torch.as_tensor(target_std, device=device, dtype=dtype) / current_std
+            final_layer.weight.mul_(scale)
+            return float(scale.detach().cpu())
+
+    return 1.0
+
+
 class GaussianBaseEnergy(torch.nn.Module):
     """Independent Gaussian reference energy for continuous visibles."""
 
@@ -52,6 +111,7 @@ class MLPEnergy(torch.nn.Module):
         num_layers: int = 1,
         data_mean: Tensor | None = None,
         data_std: Tensor | None = None,
+        output_bias: bool = False,
     ):
         super().__init__()
         self.num_visibles = num_visibles
@@ -76,12 +136,28 @@ class MLPEnergy(torch.nn.Module):
             layers.append(torch.nn.Linear(in_dim, out_dim))
             layers.append(torch.nn.SiLU())
             in_dim = out_dim
-        layers.append(torch.nn.Linear(in_dim, 1))
+        layers.append(torch.nn.Linear(in_dim, 1, bias=output_bias))
 
         self.net = torch.nn.Sequential(*layers)
+        _init_mlp_layers(self.net)
 
     def forward(self, x: Tensor) -> Tensor:
         return self.net(x).view(-1) + self.base(x)
+
+    def calibrate_final_layer(
+        self,
+        data: Tensor,
+        weights: Tensor | None = None,
+        target_std: float = 0.05,
+        batch_size: int = 4096,
+    ) -> float:
+        return _rescale_final_linear_to_target_std(
+            modules=self.net,
+            data=data,
+            weights=weights,
+            target_std=target_std,
+            batch_size=batch_size,
+        )
 
 
 ENERGY_MAP: dict[str, type[torch.nn.Module]] = {
@@ -194,10 +270,12 @@ def restore_mlp_energy(named_params: dict[str, np.ndarray]) -> MLPEnergy:
     first_weight = named_params[weight_keys[0]]
     num_visibles = first_weight.shape[1]
     hidden_dims = [named_params[key].shape[0] for key in weight_keys[:-1]]
+    final_bias_key = weight_keys[-1].replace(".weight", ".bias")
 
     return MLPEnergy(
         num_visibles=num_visibles,
         hidden_dims=hidden_dims,
         data_mean=torch.as_tensor(named_params["base.data_mean"]),
         data_std=torch.as_tensor(named_params["base.data_std"]),
+        output_bias=final_bias_key in named_params,
     )

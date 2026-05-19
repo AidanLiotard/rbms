@@ -153,6 +153,14 @@ def _init_training(
             dtype=dtype,
         )
 
+    if hasattr(params.energy, "calibrate_final_layer"):
+        scale = params.energy.calibrate_final_layer(
+            data=train_dataset.data,
+            weights=train_dataset.weights,
+            target_std=0.05,
+        )
+        print(f"Calibrated final energy layer by scale factor {scale:.6g}")
+
     # Permanent chains
     parallel_chains = params.init_chains(num_samples=num_chains)
     parallel_chains = params.sample_state(chains=parallel_chains, n_steps=gibbs_steps)
