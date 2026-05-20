@@ -113,6 +113,12 @@ def add_args_init_rbm(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     ],
     help="Energy type to use when model_type is BEBM or CEBM.",
     )
+    rbm_args.add_argument(
+        "--base_std_floor",
+        type=float,
+        default=None,
+        help="Minimum std for the Gaussian base used by CEBM energies.",
+    )
     return parser
 
 
@@ -129,6 +135,24 @@ def add_sampling_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default=None,
         type=float,
         help="(Defaults to 1.0). The inverse temperature of the RBM",
+    )
+    sampling_args.add_argument(
+        "--hmc_step_size",
+        type=float,
+        default=None,
+        help="HMC step size for continuous EBMs. If omitted, uses the CEBM sampler default.",
+    )
+    sampling_args.add_argument(
+        "--hmc_num_leapfrog_steps",
+        type=int,
+        default=None,
+        help="Number of HMC leapfrog steps for continuous EBMs. If omitted, uses the CEBM sampler default.",
+    )
+    sampling_args.add_argument(
+        "--hmc_mass",
+        type=float,
+        default=None,
+        help="HMC mass for continuous EBMs. If omitted, uses the CEBM sampler default.",
     )
     return parser
 
@@ -295,6 +319,10 @@ default_args: dict[str, Any] = {
     "num_chains": 2000,
     "num_updates": 10000,
     "beta": 1.0,
+    "base_std_floor": 0.2,
+    "hmc_step_size": None,
+    "hmc_num_leapfrog_steps": None,
+    "hmc_mass": None,
     "restore": False,
     "seed": np.random.randint(0, 1000000000000),
     "no_center": False,

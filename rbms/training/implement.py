@@ -49,6 +49,10 @@ def _init_training(
     dtype: torch.dtype,
     device: torch.device | str,
     flags: list[str],
+    base_std_floor: float = 0.2,
+    hmc_step_size: float | None = None,
+    hmc_num_leapfrog_steps: int | None = None,
+    hmc_mass: float | None = None,
     map_model: dict[str, type[EBM]] = map_model,
 ):
     if model_type is None:
@@ -123,6 +127,7 @@ def _init_training(
                     hidden_dims=hidden_dims,
                     data_mean=data_mean,
                     data_std=data_std,
+                    base_std_floor=base_std_floor,
                 )
 
             case "gaussian":
@@ -133,6 +138,7 @@ def _init_training(
                     dtype=dtype,
                     data_mean=data_mean,
                     data_std=data_std,
+                    base_std_floor=base_std_floor,
                 )
 
             case _:
@@ -161,9 +167,28 @@ def _init_training(
         )
         print(f"Calibrated final energy layer by scale factor {scale:.6g}")
 
+    sampler_kernel = None
+    sampler_kernel_params = {}
+    if model_type == "CEBM":
+        sampler_kernel = "hmc"
+        if hmc_step_size is not None:
+            sampler_kernel_params["step_size"] = hmc_step_size
+        if hmc_num_leapfrog_steps is not None:
+            sampler_kernel_params["num_leapfrog_steps"] = hmc_num_leapfrog_steps
+        if hmc_mass is not None:
+            sampler_kernel_params["mass"] = hmc_mass
+
     # Permanent chains
     parallel_chains = params.init_chains(num_samples=num_chains)
-    parallel_chains = params.sample_state(chains=parallel_chains, n_steps=gibbs_steps)
+    if sampler_kernel is None:
+        parallel_chains = params.sample_state(chains=parallel_chains, n_steps=gibbs_steps)
+    else:
+        parallel_chains = params.sample_state(
+            chains=parallel_chains,
+            n_steps=gibbs_steps,
+            kernel=sampler_kernel,
+            kernel_params=sampler_kernel_params,
+        )
 
     # Save hyperparameters
     if mult_optim:
@@ -179,6 +204,7 @@ def _init_training(
         hyperparameters["num_chains"] = num_chains
         hyperparameters["filename"] = str(filename)
         hyperparameters["energy_type"] = np.asarray(energy_type, dtype="T")
+        hyperparameters["base_std_floor"] = base_std_floor
 
     save_model(
         filename=filename,
@@ -211,6 +237,12 @@ def _init_training(
         sampling = f.create_group("sampling_args")
         sampling["gibbs_steps"] = gibbs_steps
         sampling["beta"] = beta
+        if hmc_step_size is not None:
+            sampling["hmc_step_size"] = hmc_step_size
+        if hmc_num_leapfrog_steps is not None:
+            sampling["hmc_num_leapfrog_steps"] = hmc_num_leapfrog_steps
+        if hmc_mass is not None:
+            sampling["hmc_mass"] = hmc_mass
 
         train_args = f.create_group("train_args")
         train_args["optim"] = np.asarray(optim, dtype="T")

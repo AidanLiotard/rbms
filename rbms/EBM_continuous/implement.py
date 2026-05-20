@@ -21,7 +21,6 @@ def _sample_state_hmc(
     step_size: float = 1e-2,
     num_leapfrog_steps: int = 10,
     mass: float = 1.0,
-    clamp: tuple[float, float] | None = None,
 ) -> dict[str, Tensor]:
     visible = chains["visible"].clone()
     weights = chains["weights"].clone()
@@ -50,10 +49,6 @@ def _sample_state_hmc(
 
         for leapfrog_step in range(num_leapfrog_steps):
             proposal_visible = proposal_visible + step_size * proposal_momentum / mass
-
-            if clamp is not None:
-                lo, hi = clamp
-                proposal_visible = proposal_visible.clamp(lo, hi)
 
             proposed_energy, grad = _energy_and_grad(
                 energy,

@@ -83,7 +83,7 @@ class CD(Sampler):
         self.params = params
 
     def get_metrics_display(self, metrics, **kwargs):
-        return metrics
+        return self.params.get_metrics(metrics)
 
     def get_metrics_save(self):
         return None

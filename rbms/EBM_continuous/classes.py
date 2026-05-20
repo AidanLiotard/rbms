@@ -39,6 +39,7 @@ class CEBM(EBM):
         self._num_visibles = num_visibles
         self.name = "CEBM"
         self.flags = []
+        self.last_acceptance: Tensor | None = None
 
     def __add__(self, other: EBM) -> EBM:
         raise NotImplementedError("Addition of CEBMs is not implemented yet.")
@@ -215,7 +216,12 @@ class CEBM(EBM):
         from rbms.EBM_continuous.energies import GaussianBaseEnergy
 
         data_mean, data_std = self._get_base_stats()
-        energy = GaussianBaseEnergy(data_mean=data_mean.detach().clone(), data_std=data_std.detach().clone())
+        std_floor = getattr(getattr(self.energy, "base", self.energy), "std_floor", 0.2)
+        energy = GaussianBaseEnergy(
+            data_mean=data_mean.detach().clone(),
+            data_std=data_std.detach().clone(),
+            std_floor=std_floor,
+        )
         return CEBM(
             energy=energy,
             num_visibles=self.num_visibles,
@@ -259,17 +265,21 @@ class CEBM(EBM):
 
         match kernel:
             case "hmc":
-                return _sample_state_hmc(
+                sampled = _sample_state_hmc(
                     energy=self.energy,
                     chains=new_chains,
                     n_steps=n_steps,
                     beta=beta,
                     **kernel_params,
                 )
+                self.last_acceptance = sampled.get("acceptance")
+                return sampled
             case _:
                 raise NotImplementedError(f"Unknown CEBM sampling kernel: {kernel}.")
 
     def get_metrics(self, metrics: dict[str, float]) -> dict[str, float]:
+        if self.last_acceptance is not None:
+            metrics["hmc_acceptance"] = float(self.last_acceptance.detach().cpu())
         return metrics
 
     def pre_grad_update(self) -> None:

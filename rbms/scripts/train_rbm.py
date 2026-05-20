@@ -92,6 +92,10 @@ def main(args, map_model=map_model):
             flags=flags,
             map_model=map_model,
             energy_type=args["energy_type"],
+            base_std_floor=args["base_std_floor"],
+            hmc_step_size=args["hmc_step_size"],
+            hmc_num_leapfrog_steps=args["hmc_num_leapfrog_steps"],
+            hmc_mass=args["hmc_mass"],
         )
         args["update"] = 1
 
@@ -120,7 +124,6 @@ def main(args, map_model=map_model):
         dtype=args["dtype"],
         map_model=map_model,
     )
-
     optimizer = setup_optim(args["optim"], args, params)
     from rbms.pre_grad import build_pre_grad_update
 
@@ -134,20 +137,33 @@ def main(args, map_model=map_model):
 
     match args["training_type"]:
         case "pcd":
+            sampler_kernel, sampler_kernel_params = get_sampler_kernel_args(args, params)
             sampler = PCD(
                 params=params,
                 chains=parallel_chains,
                 num_steps=args["gibbs_steps"],
                 beta=args["beta"],
+                kernel=sampler_kernel,
+                kernel_params=sampler_kernel_params,
             )
         case "cd":
-            sampler = CD(params=params, num_steps=args["gibbs_steps"], beta=args["beta"])
+            sampler_kernel, sampler_kernel_params = get_sampler_kernel_args(args, params)
+            sampler = CD(
+                params=params,
+                num_steps=args["gibbs_steps"],
+                beta=args["beta"],
+                kernel=sampler_kernel,
+                kernel_params=sampler_kernel_params,
+            )
         case "rdm":
+            sampler_kernel, sampler_kernel_params = get_sampler_kernel_args(args, params)
             sampler = RDM(
                 params=params,
                 num_chains=parallel_chains["visible"].shape[0],
                 num_steps=args["gibbs_steps"],
                 beta=args["beta"],
+                kernel=sampler_kernel,
+                kernel_params=sampler_kernel_params,
             )
 
         case _:
@@ -172,10 +188,25 @@ def main(args, map_model=map_model):
 
 def load_args_from_filename(args: dict):
     with h5py.File(args["filename"], "r") as f:
+        sampling_args = f["sampling_args"]
+        hyperparameters = f["hyperparameters"]
+        if args["base_std_floor"] is None and "base_std_floor" in hyperparameters:
+            args["base_std_floor"] = hyperparameters["base_std_floor"][()].item()
         if args["gibbs_steps"] is None:
-            args["gibbs_steps"] = f["sampling_args"]["gibbs_steps"][()].item()
+            args["gibbs_steps"] = sampling_args["gibbs_steps"][()].item()
         if args["beta"] is None:
-            args["beta"] = f["sampling_args"]["beta"][()].item()
+            args["beta"] = sampling_args["beta"][()].item()
+        if args["hmc_step_size"] is None and "hmc_step_size" in sampling_args:
+            args["hmc_step_size"] = sampling_args["hmc_step_size"][()].item()
+        if (
+            args["hmc_num_leapfrog_steps"] is None
+            and "hmc_num_leapfrog_steps" in sampling_args
+        ):
+            args["hmc_num_leapfrog_steps"] = sampling_args[
+                "hmc_num_leapfrog_steps"
+            ][()].item()
+        if args["hmc_mass"] is None and "hmc_mass" in sampling_args:
+            args["hmc_mass"] = sampling_args["hmc_mass"][()].item()
         if args["optim"] is None:
             args["optim"] = str(f["train_args"]["optim"][()])
         if args["batch_size"] is None:
@@ -196,6 +227,20 @@ def load_args_from_filename(args: dict):
             args["max_norm_grad"] = f["grad_args"]["max_norm_grad"][()].item()
 
     return args
+
+
+def get_sampler_kernel_args(args: dict, params) -> tuple[str | None, dict]:
+    if getattr(params, "name", None) != "CEBM":
+        return None, {}
+
+    kernel_params = {}
+    if args["hmc_step_size"] is not None:
+        kernel_params["step_size"] = args["hmc_step_size"]
+    if args["hmc_num_leapfrog_steps"] is not None:
+        kernel_params["num_leapfrog_steps"] = args["hmc_num_leapfrog_steps"]
+    if args["hmc_mass"] is not None:
+        kernel_params["mass"] = args["hmc_mass"]
+    return "hmc", kernel_params
 
 
 if __name__ == "__main__":

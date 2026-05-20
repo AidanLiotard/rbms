@@ -89,10 +89,20 @@ class PCD(Sampler):
         self.params = params
 
     def get_metrics_display(self, metrics, **kwargs):
-        return metrics
+        if "acceptance" in self.chains:
+            acceptance = self.chains["acceptance"]
+            if torch.is_tensor(acceptance):
+                acceptance = acceptance.detach().cpu().item()
+            metrics["acceptance"] = float(acceptance)
+        return self.params.get_metrics(metrics)
 
     def get_metrics_save(self):
-        return None
+        if "acceptance" not in self.chains:
+            return None
+        acceptance = self.chains["acceptance"]
+        if torch.is_tensor(acceptance):
+            acceptance = acceptance.detach().cpu().item()
+        return {"acceptance": np.asarray(float(acceptance))}
 
     def pre_grad_update(self):
         pass

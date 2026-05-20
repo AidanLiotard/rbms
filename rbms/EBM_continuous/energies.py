@@ -82,11 +82,12 @@ def _rescale_final_linear_to_target_std(
 class GaussianBaseEnergy(torch.nn.Module):
     """Independent Gaussian reference energy for continuous visibles."""
 
-    def __init__(self, data_mean: Tensor, data_std: Tensor):
+    def __init__(self, data_mean: Tensor, data_std: Tensor, std_floor: float = 0.2):
         super().__init__()
         self.num_visibles = data_mean.shape[0]
+        self.std_floor = float(std_floor)
         self.register_buffer("data_mean", data_mean.clone())
-        self.register_buffer("data_std", data_std.clone().clamp_min(1e-4))
+        self.register_buffer("data_std", data_std.clone().clamp_min(self.std_floor))
 
     def forward(self, x: Tensor) -> Tensor:
         z = (x - self.data_mean) / self.data_std
@@ -111,6 +112,7 @@ class MLPEnergy(torch.nn.Module):
         num_layers: int = 1,
         data_mean: Tensor | None = None,
         data_std: Tensor | None = None,
+        base_std_floor: float = 0.2,
         output_bias: bool = False,
     ):
         super().__init__()
@@ -128,7 +130,12 @@ class MLPEnergy(torch.nn.Module):
         if data_std is None:
             data_std = torch.ones(num_visibles)
 
-        self.base = GaussianBaseEnergy(data_mean=data_mean, data_std=data_std)
+        self.base_std_floor = float(base_std_floor)
+        self.base = GaussianBaseEnergy(
+            data_mean=data_mean,
+            data_std=data_std,
+            std_floor=self.base_std_floor,
+        )
 
         layers = []
         in_dim = num_visibles
@@ -202,6 +209,7 @@ def build_energy(
         energy = GaussianBaseEnergy(
             data_mean=energy_kwargs["data_mean"],
             data_std=energy_kwargs["data_std"],
+            std_floor=energy_kwargs.get("base_std_floor", 0.2),
         )
     else:
         energy = ENERGY_MAP[energy_type](
