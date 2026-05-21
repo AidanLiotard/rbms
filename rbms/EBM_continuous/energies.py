@@ -112,7 +112,7 @@ class MLPEnergy(torch.nn.Module):
         num_layers: int = 1,
         data_mean: Tensor | None = None,
         data_std: Tensor | None = None,
-        base_std_floor: float = 0.2,
+        base_std_floor: float = 0.02,
         output_bias: bool = False,
     ):
         super().__init__()
@@ -209,7 +209,7 @@ def build_energy(
         energy = GaussianBaseEnergy(
             data_mean=energy_kwargs["data_mean"],
             data_std=energy_kwargs["data_std"],
-            std_floor=energy_kwargs.get("base_std_floor", 0.2),
+            std_floor=energy_kwargs.get("base_std_floor", 0.02),
         )
     else:
         energy = ENERGY_MAP[energy_type](
