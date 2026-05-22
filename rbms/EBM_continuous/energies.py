@@ -123,7 +123,10 @@ class GaussianBaseEnergy(torch.nn.Module):
 
 
 class MLPEnergy(torch.nn.Module):
-    """Continuous visible-state energy represented by an MLP plus Gaussian tails."""
+    """Continuous visible-state energy represented by an MLP plus Gaussian tails.
+
+    A learnable visible field h contributes the linear term -x^T h.
+    """
 
     def __init__(
         self,
@@ -134,6 +137,7 @@ class MLPEnergy(torch.nn.Module):
         data_mean: Tensor | None = None,
         data_std: Tensor | None = None,
         base_std_floor: float = 0.02,
+        visible_field: Tensor | None = None,
         output_bias: bool = False,
     ):
         super().__init__()
@@ -150,6 +154,9 @@ class MLPEnergy(torch.nn.Module):
             data_mean = torch.zeros(num_visibles)
         if data_std is None:
             data_std = torch.ones(num_visibles)
+        if visible_field is None:
+            visible_field = data_mean.clone()
+        self.visible_field = torch.nn.Parameter(visible_field.clone())
 
         self.base_std_floor = float(base_std_floor)
         self.base = GaussianBaseEnergy(
@@ -170,7 +177,7 @@ class MLPEnergy(torch.nn.Module):
         _init_mlp_layers(self.net)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.net(x).view(-1) + self.base(x)
+        return self.net(x).view(-1) + self.base(x) - x @ self.visible_field
 
     def calibrate_final_layer(
         self,
@@ -189,7 +196,10 @@ class MLPEnergy(torch.nn.Module):
 
 
 class CNNEnergy(torch.nn.Module):
-    """Continuous flattened-image energy represented by a small CNN."""
+    """Continuous flattened-image energy represented by a small CNN.
+
+    A learnable visible field h contributes the linear term -x^T h.
+    """
 
     def __init__(
         self,
@@ -202,6 +212,7 @@ class CNNEnergy(torch.nn.Module):
         data_mean: Tensor | None = None,
         data_std: Tensor | None = None,
         base_std_floor: float = 0.02,
+        visible_field: Tensor | None = None,
         output_bias: bool = False,
     ):
         super().__init__()
@@ -236,7 +247,10 @@ class CNNEnergy(torch.nn.Module):
             data_mean = torch.zeros(self.num_visibles)
         if data_std is None:
             data_std = torch.ones(self.num_visibles)
-
+        if visible_field is None:
+            visible_field = data_mean.clone()
+        self.visible_field = torch.nn.Parameter(visible_field.clone())
+        
         self.base_std_floor = float(base_std_floor)
         self.base = GaussianBaseEnergy(
             data_mean=data_mean,
@@ -269,7 +283,7 @@ class CNNEnergy(torch.nn.Module):
         return self.head(features).view(-1)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self._score(x) + self.base(x)
+        return self._score(x) + self.base(x) - x @ self.visible_field
 
     def calibrate_final_layer(
         self,
@@ -388,6 +402,12 @@ def restore_energy(
         name: torch.as_tensor(array, device=device, dtype=dtype)
         for name, array in named_params.items()
     }
+    if "visible_field" in energy.state_dict() and "visible_field" not in state_dict:
+        state_dict["visible_field"] = torch.zeros(
+            energy.num_visibles,
+            device=device,
+            dtype=dtype,
+        )
     energy.load_state_dict(state_dict)
     return energy.to(device=device, dtype=dtype)
 
