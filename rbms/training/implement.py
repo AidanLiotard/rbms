@@ -118,9 +118,9 @@ def _init_training(
         )
 
         match energy_type:
-            case None | "mlp":
+            case None | "mlp" | "cnn":
                 energy = build_continuous_energy(
-                    energy_type="mlp",
+                    energy_type="mlp" if energy_type is None else energy_type,
                     num_visibles=num_visibles,
                     device=device,
                     dtype=dtype,

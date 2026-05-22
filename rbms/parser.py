@@ -82,7 +82,7 @@ def add_args_init_rbm(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=int,
         default=None,
         help=(
-            "Hidden layer sizes for MLP energies. For example, "
+            "Hidden layer sizes for MLP energies or channel counts for CNN energies. For example, "
             "`--hidden_dims 512 256 128`. If omitted, defaults to "
             "a single layer of size `num_hiddens`."
         ),
@@ -100,18 +100,19 @@ def add_args_init_rbm(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="(Defaults to None). Model to use. If None is provided, will be a RBM with the same visible type as the dataset and binary hiddens. If restore, this argument is ignored.",
     )
     rbm_args.add_argument(
-    "--energy_type",
-    type=str,
-    default=None,
-    choices=[
-        "mlp",
-        "mlp_no_w2",
-        "mlp_silu_no_w2",
-        "mlp_sigmoid_no_w2",
-        "rbm",
-        "gaussian",
-    ],
-    help="Energy type to use when model_type is BEBM or CEBM.",
+        "--energy_type",
+        type=str,
+        default=None,
+        choices=[
+            "mlp",
+            "mlp_no_w2",
+            "mlp_silu_no_w2",
+            "mlp_sigmoid_no_w2",
+            "rbm",
+            "gaussian",
+            "cnn",
+        ],
+        help="Energy type to use when model_type is BEBM or CEBM.",
     )
     rbm_args.add_argument(
         "--base_std_floor",

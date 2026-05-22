@@ -32,6 +32,27 @@ def _init_mlp_layers(
                 torch.nn.init.zeros_(module.bias)
 
 
+def _init_cnn_layers(*modules: torch.nn.Module) -> None:
+    """Initialize CNN affine layers while keeping biases neutral."""
+
+    for parent in modules:
+        for module in parent.modules():
+            if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear)):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
+
+
+def _infer_square_image_shape(num_visibles: int) -> tuple[int, int]:
+    image_side = int(num_visibles**0.5)
+    if image_side * image_side != num_visibles:
+        raise ValueError(
+            "CNNEnergy expects square flattened images unless image_shape is provided. "
+            f"Got num_visibles={num_visibles}."
+        )
+    return image_side, image_side
+
+
 def _rescale_final_linear_to_target_std(
     modules: torch.nn.Sequential,
     data: Tensor,
@@ -167,8 +188,132 @@ class MLPEnergy(torch.nn.Module):
         )
 
 
+class CNNEnergy(torch.nn.Module):
+    """Continuous flattened-image energy represented by a small CNN."""
+
+    def __init__(
+        self,
+        num_visibles: int,
+        hidden_dims: list[int] | tuple[int, ...] | None = None,
+        hidden_dim: int = 32,
+        num_layers: int = 2,
+        image_shape: tuple[int, int] | list[int] | None = None,
+        kernel_size: int = 3,
+        data_mean: Tensor | None = None,
+        data_std: Tensor | None = None,
+        base_std_floor: float = 0.02,
+        output_bias: bool = False,
+    ):
+        super().__init__()
+        self.num_visibles = int(num_visibles)
+        self.hidden_dims = _normalize_hidden_dims(
+            hidden_dims=hidden_dims,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+        )
+        self.hidden_dim = self.hidden_dims[-1]
+        self.num_layers = len(self.hidden_dims)
+        self.kernel_size = int(kernel_size)
+        if self.kernel_size <= 0 or self.kernel_size % 2 == 0:
+            raise ValueError(f"kernel_size must be a positive odd integer, got {kernel_size}.")
+
+        if image_shape is None:
+            image_shape = _infer_square_image_shape(self.num_visibles)
+        image_shape = tuple(int(dim) for dim in image_shape)
+        if len(image_shape) != 2 or any(dim <= 0 for dim in image_shape):
+            raise ValueError(f"image_shape must be a positive (height, width), got {image_shape}.")
+        if image_shape[0] * image_shape[1] != self.num_visibles:
+            raise ValueError(
+                f"image_shape={image_shape} is incompatible with num_visibles={self.num_visibles}."
+            )
+        self.image_shape = image_shape
+        self.register_buffer(
+            "_image_shape",
+            torch.tensor(image_shape, dtype=torch.int64),
+        )
+
+        if data_mean is None:
+            data_mean = torch.zeros(self.num_visibles)
+        if data_std is None:
+            data_std = torch.ones(self.num_visibles)
+
+        self.base_std_floor = float(base_std_floor)
+        self.base = GaussianBaseEnergy(
+            data_mean=data_mean,
+            data_std=data_std,
+            std_floor=self.base_std_floor,
+        )
+
+        conv_layers = []
+        in_channels = 1
+        for out_channels in self.hidden_dims:
+            conv_layers.append(
+                torch.nn.Conv2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=self.kernel_size,
+                    padding=self.kernel_size // 2,
+                )
+            )
+            conv_layers.append(torch.nn.SiLU())
+            in_channels = out_channels
+
+        self.conv = torch.nn.Sequential(*conv_layers)
+        self.pool = torch.nn.AdaptiveAvgPool2d(output_size=1)
+        self.head = torch.nn.Linear(in_channels, 1, bias=output_bias)
+        _init_cnn_layers(self.conv, self.head)
+
+    def _score(self, x: Tensor) -> Tensor:
+        image = x.view(x.shape[0], 1, *self.image_shape)
+        features = self.pool(self.conv(image)).flatten(start_dim=1)
+        return self.head(features).view(-1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self._score(x) + self.base(x)
+
+    def calibrate_final_layer(
+        self,
+        data: Tensor,
+        weights: Tensor | None = None,
+        target_std: float = 0.05,
+        batch_size: int = 4096,
+        eps: float = 1e-12,
+    ) -> float:
+        device = self.head.weight.device
+        dtype = self.head.weight.dtype
+        data = data.to(device=device, dtype=dtype)
+        if weights is not None:
+            weights = weights.to(device=device, dtype=dtype).view(-1)
+
+        outputs = []
+        weight_chunks = []
+        with torch.no_grad():
+            for start in range(0, data.shape[0], batch_size):
+                stop = min(start + batch_size, data.shape[0])
+                outputs.append(self._score(data[start:stop]))
+                if weights is not None:
+                    weight_chunks.append(weights[start:stop])
+
+            values = torch.cat(outputs)
+            if weights is None:
+                current_std = values.std(unbiased=False)
+            else:
+                sample_weights = torch.cat(weight_chunks)
+                norm_weights = sample_weights / sample_weights.sum()
+                mean = (values * norm_weights).sum()
+                current_std = ((values - mean).square() * norm_weights).sum().sqrt()
+
+            if torch.isfinite(current_std) and current_std > eps:
+                scale = torch.as_tensor(target_std, device=device, dtype=dtype) / current_std
+                self.head.weight.mul_(scale)
+                return float(scale.detach().cpu())
+
+        return 1.0
+
+
 ENERGY_MAP: dict[str, type[torch.nn.Module]] = {
     "mlp": MLPEnergy,
+    "cnn": CNNEnergy,
     "gaussian": GaussianBaseEnergy,
 }
 
@@ -231,6 +376,8 @@ def restore_energy(
             energy = restore_gaussian_energy(named_params)
         case "mlp":
             energy = restore_mlp_energy(named_params)
+        case "cnn":
+            energy = restore_cnn_energy(named_params)
         case _:
             raise ValueError(
                 f"Cannot restore unknown continuous energy type '{energy_type}'. "
@@ -249,6 +396,8 @@ def identify_energy_type(named_params: dict[str, np.ndarray]) -> str:
     keys = set(named_params)
 
     match keys:
+        case keys if any(name.startswith("conv.") for name in keys):
+            return "cnn"
         case keys if any(name.startswith("net.") for name in keys):
             return "mlp"
         case keys if {"data_mean", "data_std"} <= keys:
@@ -286,4 +435,45 @@ def restore_mlp_energy(named_params: dict[str, np.ndarray]) -> MLPEnergy:
         data_mean=torch.as_tensor(named_params["base.data_mean"]),
         data_std=torch.as_tensor(named_params["base.data_std"]),
         output_bias=final_bias_key in named_params,
+    )
+
+
+def restore_cnn_energy(named_params: dict[str, np.ndarray]) -> CNNEnergy:
+    conv_weight_keys = sorted(
+        [
+            name
+            for name in named_params
+            if name.startswith("conv.") and name.endswith(".weight")
+        ],
+        key=lambda name: int(name.split(".")[1]),
+    )
+    if len(conv_weight_keys) == 0:
+        raise ValueError("Cannot restore CNNEnergy without convolution weight tensors.")
+
+    channels = [named_params[key].shape[0] for key in conv_weight_keys]
+    kernel_size = named_params[conv_weight_keys[0]].shape[-1]
+    if "_image_shape" in named_params:
+        image_shape = tuple(int(dim) for dim in named_params["_image_shape"])
+    else:
+        image_shape = None
+
+    if "base.data_mean" in named_params:
+        data_mean = torch.as_tensor(named_params["base.data_mean"])
+        data_std = torch.as_tensor(named_params["base.data_std"])
+        num_visibles = data_mean.shape[0]
+    elif image_shape is not None:
+        data_mean = None
+        data_std = None
+        num_visibles = image_shape[0] * image_shape[1]
+    else:
+        raise ValueError("Cannot restore CNNEnergy without base stats or saved image shape.")
+
+    return CNNEnergy(
+        num_visibles=num_visibles,
+        hidden_dims=channels,
+        image_shape=image_shape,
+        kernel_size=kernel_size,
+        data_mean=data_mean,
+        data_std=data_std,
+        output_bias="head.bias" in named_params,
     )
