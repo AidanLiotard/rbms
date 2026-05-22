@@ -53,6 +53,8 @@ def _init_training(
     hmc_step_size: float | None = None,
     hmc_num_leapfrog_steps: int | None = None,
     hmc_mass: float | None = None,
+    sampling_kernel: str | None = None,
+    nuts_max_delta_energy: float | None = None,
     map_model: dict[str, type[EBM]] = map_model,
 ):
     if model_type is None:
@@ -127,6 +129,7 @@ def _init_training(
                     hidden_dims=hidden_dims,
                     data_mean=data_mean,
                     data_std=data_std,
+                    visible_field=data_mean,
                     base_std_floor=base_std_floor,
                 )
 
@@ -170,13 +173,15 @@ def _init_training(
     sampler_kernel = None
     sampler_kernel_params = {}
     if model_type == "CEBM":
-        sampler_kernel = "hmc"
+        sampler_kernel = "hmc" if sampling_kernel is None else sampling_kernel
         if hmc_step_size is not None:
             sampler_kernel_params["step_size"] = hmc_step_size
         if hmc_num_leapfrog_steps is not None:
             sampler_kernel_params["num_leapfrog_steps"] = hmc_num_leapfrog_steps
         if hmc_mass is not None:
             sampler_kernel_params["mass"] = hmc_mass
+        if nuts_max_delta_energy is not None:
+            sampler_kernel_params["max_delta_energy"] = nuts_max_delta_energy
 
     # Permanent chains
     parallel_chains = params.init_chains(num_samples=num_chains)
@@ -243,6 +248,10 @@ def _init_training(
             sampling["hmc_num_leapfrog_steps"] = hmc_num_leapfrog_steps
         if hmc_mass is not None:
             sampling["hmc_mass"] = hmc_mass
+        if sampling_kernel is not None:
+            sampling["sampling_kernel"] = np.asarray(sampling_kernel, dtype="T")
+        if nuts_max_delta_energy is not None:
+            sampling["nuts_max_delta_energy"] = nuts_max_delta_energy
 
         train_args = f.create_group("train_args")
         train_args["optim"] = np.asarray(optim, dtype="T")

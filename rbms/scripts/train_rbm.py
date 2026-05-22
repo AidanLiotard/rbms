@@ -93,9 +93,11 @@ def main(args, map_model=map_model):
             map_model=map_model,
             energy_type=args["energy_type"],
             base_std_floor=args["base_std_floor"],
+            sampling_kernel=args["sampling_kernel"],
             hmc_step_size=args["hmc_step_size"],
             hmc_num_leapfrog_steps=args["hmc_num_leapfrog_steps"],
             hmc_mass=args["hmc_mass"],
+            nuts_max_delta_energy=args["nuts_max_delta_energy"],
         )
         args["update"] = 1
 
@@ -207,6 +209,15 @@ def load_args_from_filename(args: dict):
             ][()].item()
         if args["hmc_mass"] is None and "hmc_mass" in sampling_args:
             args["hmc_mass"] = sampling_args["hmc_mass"][()].item()
+        if args["sampling_kernel"] is None and "sampling_kernel" in sampling_args:
+            args["sampling_kernel"] = str(sampling_args["sampling_kernel"][()].decode())
+        if (
+            args["nuts_max_delta_energy"] is None
+            and "nuts_max_delta_energy" in sampling_args
+        ):
+            args["nuts_max_delta_energy"] = sampling_args["nuts_max_delta_energy"][
+                ()
+            ].item()
         if args["optim"] is None:
             args["optim"] = str(f["train_args"]["optim"][()])
         if args["batch_size"] is None:
@@ -240,7 +251,9 @@ def get_sampler_kernel_args(args: dict, params) -> tuple[str | None, dict]:
         kernel_params["num_leapfrog_steps"] = args["hmc_num_leapfrog_steps"]
     if args["hmc_mass"] is not None:
         kernel_params["mass"] = args["hmc_mass"]
-    return "hmc", kernel_params
+    if args["nuts_max_delta_energy"] is not None:
+        kernel_params["max_delta_energy"] = args["nuts_max_delta_energy"]
+    return (args["sampling_kernel"] or "hmc"), kernel_params
 
 
 if __name__ == "__main__":

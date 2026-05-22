@@ -138,22 +138,38 @@ def add_sampling_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="(Defaults to 1.0). The inverse temperature of the RBM",
     )
     sampling_args.add_argument(
+        "--sampling_kernel",
+        type=str,
+        default=None,
+        choices=["hmc", "nuts"],
+        help="Sampling kernel for continuous EBMs. If omitted, defaults to HMC.",
+    )
+    sampling_args.add_argument(
         "--hmc_step_size",
         type=float,
         default=None,
-        help="HMC step size for continuous EBMs. If omitted, uses the CEBM sampler default.",
+        help="Step size for continuous EBM samplers. If omitted, uses the sampler default.",
     )
     sampling_args.add_argument(
         "--hmc_num_leapfrog_steps",
         type=int,
         default=None,
-        help="Number of HMC leapfrog steps for continuous EBMs. If omitted, uses the CEBM sampler default.",
+        help=(
+            "Leapfrog steps for HMC, or approximate maximum depth for NUTS. "
+            "If omitted, uses the sampler default."
+        ),
     )
     sampling_args.add_argument(
         "--hmc_mass",
         type=float,
         default=None,
-        help="HMC mass for continuous EBMs. If omitted, uses the CEBM sampler default.",
+        help="Mass for continuous EBM samplers. If omitted, uses the sampler default.",
+    )
+    sampling_args.add_argument(
+        "--nuts_max_delta_energy",
+        type=float,
+        default=None,
+        help="Divergence threshold for NUTS. If omitted, uses the sampler default.",
     )
     return parser
 
@@ -324,6 +340,8 @@ default_args: dict[str, Any] = {
     "hmc_step_size": None,
     "hmc_num_leapfrog_steps": None,
     "hmc_mass": None,
+    "sampling_kernel": None,
+    "nuts_max_delta_energy": None,
     "restore": False,
     "seed": np.random.randint(0, 1000000000000),
     "no_center": False,
