@@ -7,7 +7,7 @@ from tqdm.autonotebook import tqdm
 
 from rbms.classes import EBM, Sampler
 from rbms.dataset.dataset_class import RBMDataset
-from rbms.io import save_model, save_sampler
+from rbms.io import save_chains, save_model, save_sampler
 
 
 # @torch.no_grad
@@ -23,7 +23,9 @@ def train(
     curr_update: int,
     pre_grad_update: torch.nn.Sequential,
     elapsed_time: float,
-    checkpoints: np.ndarray,
+    model_checkpoints: np.ndarray,
+    chain_checkpoints: np.ndarray,
+    metric_checkpoints: np.ndarray,
     num_updates: int,
     filename: str,
 ):
@@ -74,7 +76,17 @@ def train(
         flags = []
         flags = params.save_flags(flags)
         flags = sampler.save_flags(flags)
-        if idx in checkpoints or idx == num_updates:
+        save_model_now = idx in model_checkpoints or idx == num_updates
+        save_chains_now = idx in chain_checkpoints or idx == num_updates
+        save_metrics_now = idx in metric_checkpoints or idx == num_updates
+
+        if idx in model_checkpoints:
+            flags.append("checkpoint_model")
+        if idx in chain_checkpoints:
+            flags.append("checkpoint_chain")
+        if idx in metric_checkpoints:
+            flags.append("checkpoint_metric")
+        if save_model_now or idx == num_updates:
             flags.append("checkpoint")
 
         if len(flags) > 0:
@@ -97,15 +109,20 @@ def train(
             # pbar.write(metrics)
             curr_time = time.perf_counter() - start
             learning_rate = torch.tensor([opt.param_groups[0]["lr"] for opt in optimizer])
-            save_model(
-                filename=filename,
-                params=params,
-                chains=parallel_chains,
-                num_updates=idx,
-                time=curr_time + elapsed_time,
-                learning_rate=learning_rate,
-                flags=flags,
-            )
+            if save_model_now:
+                save_model(
+                    filename=filename,
+                    params=params,
+                    chains=parallel_chains,
+                    num_updates=idx,
+                    time=curr_time + elapsed_time,
+                    learning_rate=learning_rate,
+                    flags=flags,
+                    save_chains=save_chains_now,
+                )
+            elif save_chains_now:
+                save_chains(filename=filename, chains=parallel_chains, update=idx)
 
-            save_sampler(filename, sampler, idx)
+            if save_metrics_now:
+                save_sampler(filename, sampler, idx)
         pbar.update(1)

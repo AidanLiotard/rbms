@@ -48,6 +48,24 @@ def add_args_saves(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default=50,
         help="(Defaults to 50). Number of models to save during the training.",
     )
+    save_args.add_argument(
+        "--n_save_model",
+        type=int,
+        default=None,
+        help="Optional dedicated cadence for model checkpoints. Falls back to --n_save.",
+    )
+    save_args.add_argument(
+        "--n_save_chain",
+        type=int,
+        default=None,
+        help="Optional dedicated cadence for chain checkpoints. Falls back to --n_save.",
+    )
+    save_args.add_argument(
+        "--n_save_metric",
+        type=int,
+        default=None,
+        help="Optional dedicated cadence for metric checkpoints. Falls back to --n_save.",
+    )
 
     save_args.add_argument(
         "--spacing",
@@ -149,6 +167,33 @@ def add_sampling_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=float,
         default=None,
         help="Step size for continuous EBM samplers. If omitted, uses the sampler default.",
+    )
+    sampling_args.add_argument(
+        "--hmc_step_size_target",
+        type=float,
+        default=None,
+        help=(
+            "Target acceptance rate for optional HMC step-size warmup adaptation. "
+            "Used together with --hmc_step_size_rate."
+        ),
+    )
+    sampling_args.add_argument(
+        "--hmc_step_size_rate",
+        type=float,
+        default=None,
+        help=(
+            "Learning rate for optional HMC step-size warmup adaptation. "
+            "Used together with --hmc_step_size_target."
+        ),
+    )
+    sampling_args.add_argument(
+        "--hmc_step_size_warmup",
+        type=int,
+        default=None,
+        help=(
+            "Number of initial HMC transitions used for step-size adaptation. "
+            "After this warmup, the sampler keeps the adapted step size fixed."
+        ),
     )
     sampling_args.add_argument(
         "--hmc_num_leapfrog_steps",
@@ -323,6 +368,9 @@ def match_args_dtype(args: dict[str, Any]) -> dict[str, Any]:
 default_args: dict[str, Any] = {
     "filename": "RBM.h5",
     "n_save": 50,
+    "n_save_model": None,
+    "n_save_chain": None,
+    "n_save_metric": None,
     "acc_ptt": 0.25,
     "acc_ll": 0.7,
     "spacing": "exp",
@@ -338,6 +386,9 @@ default_args: dict[str, Any] = {
     "beta": 1.0,
     "base_std_floor": 0.2,
     "hmc_step_size": None,
+    "hmc_step_size_target": None,
+    "hmc_step_size_rate": None,
+    "hmc_step_size_warmup": None,
     "hmc_num_leapfrog_steps": None,
     "hmc_mass": None,
     "sampling_kernel": None,

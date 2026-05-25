@@ -1,6 +1,7 @@
 import argparse
 
 import h5py
+import numpy as np
 import torch
 
 from rbms import get_saved_updates
@@ -40,11 +41,6 @@ def create_parser() -> argparse.ArgumentParser:
 
 
 def main(args, map_model=map_model):
-    checkpoints = get_checkpoints(
-        num_updates=args["num_updates"],
-        n_save=args["n_save"],
-        spacing=args["spacing"],
-    )
     train_dataset, test_dataset = load_dataset(
         dataset_name=args["dataset"],
         test_dataset_name=args["test_dataset"],
@@ -55,7 +51,7 @@ def main(args, map_model=map_model):
         device=args["device"],
         dtype=args["dtype"],
     )
-    flags = ["checkpoint"]
+    flags = ["checkpoint", "checkpoint_model", "checkpoint_chain", "checkpoint_metric"]
     if not args["restore"]:
         args = set_args_default(args, default_args=default_args)
         _init_training(
@@ -69,6 +65,9 @@ def main(args, map_model=map_model):
             model_type=args["model_type"],
             filename=args["filename"],
             n_save=args["n_save"],
+            n_save_model=args["n_save_model"],
+            n_save_chain=args["n_save_chain"],
+            n_save_metric=args["n_save_metric"],
             spacing=args["spacing"],
             batch_size=args["batch_size"],
             optim=args["optim"],
@@ -95,6 +94,9 @@ def main(args, map_model=map_model):
             base_std_floor=args["base_std_floor"],
             sampling_kernel=args["sampling_kernel"],
             hmc_step_size=args["hmc_step_size"],
+            hmc_step_size_target=args["hmc_step_size_target"],
+            hmc_step_size_rate=args["hmc_step_size_rate"],
+            hmc_step_size_warmup=args["hmc_step_size_warmup"],
             hmc_num_leapfrog_steps=args["hmc_num_leapfrog_steps"],
             hmc_mass=args["hmc_mass"],
             nuts_max_delta_energy=args["nuts_max_delta_energy"],
@@ -106,6 +108,7 @@ def main(args, map_model=map_model):
     args = set_args_default(args, default_args)
     if args["update"] is None:
         args["update"] = get_saved_updates(args["filename"])[-1]
+    model_checkpoints, chain_checkpoints, metric_checkpoints = get_save_checkpoints(args)
     (
         params,
         parallel_chains,
@@ -182,7 +185,9 @@ def main(args, map_model=map_model):
         curr_update=args["update"],
         pre_grad_update=pre_grad_update,
         elapsed_time=elapsed_time,
-        checkpoints=checkpoints,
+        model_checkpoints=model_checkpoints,
+        chain_checkpoints=chain_checkpoints,
+        metric_checkpoints=metric_checkpoints,
         num_updates=args["num_updates"],
         filename=args["filename"],
     )
@@ -200,6 +205,22 @@ def load_args_from_filename(args: dict):
             args["beta"] = sampling_args["beta"][()].item()
         if args["hmc_step_size"] is None and "hmc_step_size" in sampling_args:
             args["hmc_step_size"] = sampling_args["hmc_step_size"][()].item()
+        if (
+            args["hmc_step_size_target"] is None
+            and "hmc_step_size_target" in sampling_args
+        ):
+            args["hmc_step_size_target"] = sampling_args["hmc_step_size_target"][
+                ()
+            ].item()
+        if args["hmc_step_size_rate"] is None and "hmc_step_size_rate" in sampling_args:
+            args["hmc_step_size_rate"] = sampling_args["hmc_step_size_rate"][()].item()
+        if (
+            args["hmc_step_size_warmup"] is None
+            and "hmc_step_size_warmup" in sampling_args
+        ):
+            args["hmc_step_size_warmup"] = sampling_args["hmc_step_size_warmup"][
+                ()
+            ].item()
         if (
             args["hmc_num_leapfrog_steps"] is None
             and "hmc_num_leapfrog_steps" in sampling_args
@@ -236,6 +257,19 @@ def load_args_from_filename(args: dict):
             args["normalize_grad"] = f["grad_args"]["normalize_grad"][()].item()
         if args["max_norm_grad"] is None:
             args["max_norm_grad"] = f["grad_args"]["max_norm_grad"][()].item()
+        save_args = f["save_args"]
+        if args["n_save_model"] is None and "n_save_model" in save_args:
+            args["n_save_model"] = save_args["n_save_model"][()].item()
+        if args["n_save_chain"] is None and "n_save_chain" in save_args:
+            args["n_save_chain"] = save_args["n_save_chain"][()].item()
+        if args["n_save_metric"] is None and "n_save_metric" in save_args:
+            args["n_save_metric"] = save_args["n_save_metric"][()].item()
+        if args["n_save_model"] is None and "n_save" in save_args:
+            args["n_save_model"] = save_args["n_save"][()].item()
+        if args["n_save_chain"] is None and "n_save" in save_args:
+            args["n_save_chain"] = save_args["n_save"][()].item()
+        if args["n_save_metric"] is None and "n_save" in save_args:
+            args["n_save_metric"] = save_args["n_save"][()].item()
 
     return args
 
@@ -247,6 +281,12 @@ def get_sampler_kernel_args(args: dict, params) -> tuple[str | None, dict]:
     kernel_params = {}
     if args["hmc_step_size"] is not None:
         kernel_params["step_size"] = args["hmc_step_size"]
+    if args["hmc_step_size_target"] is not None:
+        kernel_params["step_size_target"] = args["hmc_step_size_target"]
+    if args["hmc_step_size_rate"] is not None:
+        kernel_params["step_size_rate"] = args["hmc_step_size_rate"]
+    if args["hmc_step_size_warmup"] is not None:
+        kernel_params["step_size_warmup"] = args["hmc_step_size_warmup"]
     if args["hmc_num_leapfrog_steps"] is not None:
         kernel_params["num_leapfrog_steps"] = args["hmc_num_leapfrog_steps"]
     if args["hmc_mass"] is not None:
@@ -254,6 +294,23 @@ def get_sampler_kernel_args(args: dict, params) -> tuple[str | None, dict]:
     if args["nuts_max_delta_energy"] is not None:
         kernel_params["max_delta_energy"] = args["nuts_max_delta_energy"]
     return (args["sampling_kernel"] or "hmc"), kernel_params
+
+
+def get_save_checkpoints(args: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    n_save_model = args.get("n_save_model")
+    n_save_chain = args.get("n_save_chain")
+    n_save_metric = args.get("n_save_metric")
+    if n_save_model is None:
+        n_save_model = args["n_save"]
+    if n_save_chain is None:
+        n_save_chain = args["n_save"]
+    if n_save_metric is None:
+        n_save_metric = args["n_save"]
+    return (
+        get_checkpoints(args["num_updates"], n_save_model, args["spacing"]),
+        get_checkpoints(args["num_updates"], n_save_chain, args["spacing"]),
+        get_checkpoints(args["num_updates"], n_save_metric, args["spacing"]),
+    )
 
 
 if __name__ == "__main__":

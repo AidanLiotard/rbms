@@ -61,14 +61,12 @@ def build_pre_grad_update(
     max_grad_norm: float,
     **kwargs,
 ):
-    return torch.compile(
-        torch.nn.Sequential(
-            *[L1Regularization(optimizer=optimizer, lambda_l1=lambda_l1)]
-            * (lambda_l1 > 0),
-            *[L2Regularization(optimizer=optimizer, lambda_l2=lambda_l2)]
-            * (lambda_l2 > 0),
-            *[NormalizeGrad(optimizer=optimizer)] * normalize_grad,
-            *[ClipGradNorm(optimizer=optimizer, max_grad_norm=max_grad_norm)]
-            * (max_grad_norm > 0),
-        )
+    return torch.nn.Sequential(
+        *[L1Regularization(optimizer=optimizer, lambda_l1=lambda_l1)]
+        * (lambda_l1 > 0),
+        *[L2Regularization(optimizer=optimizer, lambda_l2=lambda_l2)]
+        * (lambda_l2 > 0),
+        *[NormalizeGrad(optimizer=optimizer)] * normalize_grad,
+        *[ClipGradNorm(optimizer=optimizer, max_grad_norm=max_grad_norm)]
+        * (max_grad_norm > 0),
     )

@@ -31,6 +31,14 @@ class RDM(Sampler):
             kernel=kernel,
             kernel_params=kernel_params,
         )
+        if "step_size" in self.chains:
+            self.kernel_params["step_size"] = float(
+                torch.as_tensor(self.chains["step_size"]).detach().cpu().item()
+            )
+        if "step_size_warmup" in self.chains:
+            self.kernel_params["step_size_warmup"] = int(
+                torch.as_tensor(self.chains["step_size_warmup"]).detach().cpu().item()
+            )
 
     def get_conf_grad(self, batch: Tensor, **kwargs):
         self.sample(num_steps=self.num_steps, **kwargs)

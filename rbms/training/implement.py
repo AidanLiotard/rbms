@@ -28,6 +28,9 @@ def _init_training(
     energy_type: str,
     filename: str,
     n_save: int,
+    n_save_model: int | None,
+    n_save_chain: int | None,
+    n_save_metric: int | None,
     spacing: str,
     batch_size: int,
     optim: str,
@@ -51,6 +54,9 @@ def _init_training(
     flags: list[str],
     base_std_floor: float = 0.2,
     hmc_step_size: float | None = None,
+    hmc_step_size_target: float | None = None,
+    hmc_step_size_rate: float | None = None,
+    hmc_step_size_warmup: int | None = None,
     hmc_num_leapfrog_steps: int | None = None,
     hmc_mass: float | None = None,
     sampling_kernel: str | None = None,
@@ -129,7 +135,6 @@ def _init_training(
                     hidden_dims=hidden_dims,
                     data_mean=data_mean,
                     data_std=data_std,
-                    visible_field=data_mean,
                     base_std_floor=base_std_floor,
                 )
 
@@ -176,6 +181,12 @@ def _init_training(
         sampler_kernel = "hmc" if sampling_kernel is None else sampling_kernel
         if hmc_step_size is not None:
             sampler_kernel_params["step_size"] = hmc_step_size
+        if hmc_step_size_target is not None:
+            sampler_kernel_params["step_size_target"] = hmc_step_size_target
+        if hmc_step_size_rate is not None:
+            sampler_kernel_params["step_size_rate"] = hmc_step_size_rate
+        if hmc_step_size_warmup is not None:
+            sampler_kernel_params["step_size_warmup"] = hmc_step_size_warmup
         if hmc_num_leapfrog_steps is not None:
             sampler_kernel_params["num_leapfrog_steps"] = hmc_num_leapfrog_steps
         if hmc_mass is not None:
@@ -244,6 +255,12 @@ def _init_training(
         sampling["beta"] = beta
         if hmc_step_size is not None:
             sampling["hmc_step_size"] = hmc_step_size
+        if hmc_step_size_target is not None:
+            sampling["hmc_step_size_target"] = hmc_step_size_target
+        if hmc_step_size_rate is not None:
+            sampling["hmc_step_size_rate"] = hmc_step_size_rate
+        if hmc_step_size_warmup is not None:
+            sampling["hmc_step_size_warmup"] = hmc_step_size_warmup
         if hmc_num_leapfrog_steps is not None:
             sampling["hmc_num_leapfrog_steps"] = hmc_num_leapfrog_steps
         if hmc_mass is not None:
@@ -262,6 +279,12 @@ def _init_training(
 
         save_args = f.create_group("save_args")
         save_args["n_save"] = n_save
+        if n_save_model is not None:
+            save_args["n_save_model"] = n_save_model
+        if n_save_chain is not None:
+            save_args["n_save_chain"] = n_save_chain
+        if n_save_metric is not None:
+            save_args["n_save_metric"] = n_save_metric
         save_args["spacing"] = np.asarray(spacing, dtype="T")
 
 

@@ -40,6 +40,14 @@ class PCD(Sampler):
             kernel=kernel,
             kernel_params=kernel_params,
         )
+        if "step_size" in self.chains:
+            self.kernel_params["step_size"] = float(
+                torch.as_tensor(self.chains["step_size"]).detach().cpu().item()
+            )
+        if "step_size_warmup" in self.chains:
+            self.kernel_params["step_size_warmup"] = int(
+                torch.as_tensor(self.chains["step_size_warmup"]).detach().cpu().item()
+            )
 
     @torch.compiler.disable
     def named_parameters(self):

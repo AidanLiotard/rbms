@@ -17,6 +17,7 @@ def save_model(
     time: float,
     learning_rate: Tensor,
     flags: list[str] = [],
+    save_chains: bool = False,
 ) -> None:
     """Save the current state of the model.
 
@@ -49,11 +50,13 @@ def save_model(
         checkpoint["numpy_rng_arg4"] = np.random.get_state()[4]
         checkpoint["time"] = time
         checkpoint["learning_rate"] = learning_rate.cpu().numpy()
-        # Update the parallel chains to resume training
+        # Update the latest chains used to resume training from this model checkpoint.
         if "parallel_chains" in f.keys():
             f["parallel_chains"][...] = chains["visible"].cpu().numpy()
         else:
             f["parallel_chains"] = chains["visible"].cpu().numpy()
+        if save_chains:
+            checkpoint["parallel_chains"] = chains["visible"].cpu().numpy()
 
         if "model_type" not in f.keys():
             f["model_type"] = name
@@ -115,9 +118,11 @@ def load_model(
     """
     last_file_key = f"update_{index}"
     with h5py.File(filename, "r") as f:
-        visible = torch.from_numpy(f["parallel_chains"][()]).to(
-            device=device, dtype=dtype
-        )
+        if "parallel_chains" in f[last_file_key]:
+            visible_data = f[last_file_key]["parallel_chains"][()]
+        else:
+            visible_data = f["parallel_chains"][()]
+        visible = torch.from_numpy(visible_data).to(device=device, dtype=dtype)
         # Elapsed time
         start = np.array(f[last_file_key]["time"]).item()
 
@@ -129,6 +134,18 @@ def load_model(
     if restore:
         restore_rng_state(filename=filename, index=index)
     return (params, perm_chains, start)
+
+
+@torch.compiler.disable
+def save_chains(filename: str, chains: dict[str, Tensor], update: int) -> None:
+    with h5py.File(filename, "a") as f:
+        if "chains" not in f.keys():
+            f.create_group("chains")
+        chain_key = f"update_{update}"
+        if chain_key in f["chains"]:
+            del f["chains"][chain_key]
+        chain_group = f["chains"].create_group(chain_key)
+        chain_group["parallel_chains"] = chains["visible"].cpu().numpy()
 
 
 def save_sampler(filename: str, sampler: Sampler, update: int):
@@ -148,5 +165,18 @@ def save_sampler(filename: str, sampler: Sampler, update: int):
                 f["sampler"][n] = p
 
         if metrics is not None:
+            if "metrics" not in f.keys():
+                f.create_group("metrics")
+            metric_key = f"update_{update}"
+            if metric_key in f["metrics"]:
+                metric_group = f["metrics"][metric_key]
+            else:
+                metric_group = f["metrics"].create_group(metric_key)
             for n, p in metrics.items():
-                f[f"update_{update}"][n] = p
+                if n in metric_group:
+                    del metric_group[n]
+                metric_group[n] = p
+                if f"update_{update}" in f:
+                    if n in f[f"update_{update}"]:
+                        del f[f"update_{update}"][n]
+                    f[f"update_{update}"][n] = p

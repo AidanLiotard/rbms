@@ -11,25 +11,65 @@ def _energy_and_grad(
     visible: Tensor,
     beta: float,
 ) -> tuple[Tensor, Tensor]:
-    visible_grad_input = visible.detach().requires_grad_(True)
-    energy_value = beta * energy(visible_grad_input).view(-1)
-    grad = torch.autograd.grad(energy_value.sum(), visible_grad_input)[0]
+    with torch.enable_grad():
+        visible_grad_input = visible.detach().requires_grad_(True)
+        energy_value = beta * energy(visible_grad_input).view(-1)
+        grad = torch.autograd.grad(energy_value.sum(), visible_grad_input)[0]
     return energy_value.detach(), grad.detach()
 
 
 def _kinetic_energy(
     momentum: Tensor,
-    mass: float,
+    mass: Tensor,
 ) -> Tensor:
-    return 0.5 * momentum.square().flatten(start_dim=1).sum(dim=1) / mass
+    mass_view = mass.reshape(1, -1)
+    return 0.5 * (momentum.square() / mass_view).flatten(start_dim=1).sum(dim=1)
 
 
 def _log_joint(
     potential_energy: Tensor,
     momentum: Tensor,
-    mass: float,
+    mass: Tensor,
 ) -> Tensor:
     return -potential_energy - _kinetic_energy(momentum, mass)
+
+
+def _resolve_mass(
+    energy: torch.nn.Module,
+    visible: Tensor,
+    mass: float | Tensor | None,
+    mass_floor: float = 1e-4,
+) -> Tensor:
+    if mass is None:
+        base = getattr(getattr(energy, "base", energy), "data_std", None)
+        if base is None:
+            mass = torch.ones(visible.shape[1], device=visible.device, dtype=visible.dtype)
+        else:
+            mass = torch.as_tensor(base, device=visible.device, dtype=visible.dtype).square()
+
+    mass_tensor = torch.as_tensor(mass, device=visible.device, dtype=visible.dtype).flatten()
+    if mass_tensor.numel() == 1:
+        mass_tensor = mass_tensor.expand(visible.shape[1])
+    elif mass_tensor.numel() != visible.shape[1]:
+        raise ValueError(
+            "HMC mass must be a scalar or a diagonal vector matching the visible dimension, "
+            f"got shape {tuple(mass_tensor.shape)} for {visible.shape[1]} visibles."
+        )
+    if torch.any(mass_tensor <= 0):
+        raise ValueError("HMC mass entries must be strictly positive.")
+    return mass_tensor.clamp_min(mass_floor)
+
+
+def _adapt_step_size(
+    step_size: float,
+    acceptance: Tensor | float,
+    target: float,
+    rate: float,
+) -> float:
+    acceptance_value = float(
+        acceptance.detach().cpu() if torch.is_tensor(acceptance) else acceptance
+    )
+    return float(step_size * math.exp(rate * (acceptance_value - target)))
 
 
 def _leapfrog_step(
@@ -40,14 +80,14 @@ def _leapfrog_step(
     step_size: float,
     direction: int,
     beta: float,
-    mass: float,
+    mass: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Perform one leapfrog step in direction +1 or -1."""
 
     eps = float(direction) * step_size
 
     momentum_half = momentum - 0.5 * eps * grad
-    visible_new = visible + eps * momentum_half / mass
+    visible_new = visible + eps * momentum_half / mass.reshape(1, -1)
     energy_new, grad_new = _energy_and_grad(
         energy=energy,
         visible=visible_new,
@@ -93,7 +133,7 @@ def _build_tree_nuts(
     depth: int,
     step_size: float,
     beta: float,
-    mass: float,
+    mass: Tensor,
     initial_log_joint: Tensor,
     max_delta_energy: float,
 ) -> dict[str, Tensor]:
@@ -257,7 +297,10 @@ def _sample_state_hmc(
     beta: float = 1.0,
     step_size: float = 1e-2,
     num_leapfrog_steps: int = 10,
-    mass: float = 1.0,
+    mass: float | Tensor | None = None,
+    step_size_target: float | None = None,
+    step_size_rate: float | None = None,
+    step_size_warmup: int | None = None,
 ) -> dict[str, Tensor]:
     visible = chains["visible"].clone()
     weights = chains["weights"].clone()
@@ -268,11 +311,12 @@ def _sample_state_hmc(
         raise ValueError(
             f"HMC num_leapfrog_steps must be positive, got {num_leapfrog_steps}."
         )
-    if mass <= 0:
-        raise ValueError(f"HMC mass must be positive, got {mass}.")
 
     acceptances = []
-    momentum_std = mass**0.5
+    mass_tensor = _resolve_mass(energy=energy, visible=visible, mass=mass)
+    momentum_std = mass_tensor.sqrt().reshape(1, -1)
+    adapted_step_size = float(step_size)
+    warmup_remaining = 0 if step_size_warmup is None else max(0, int(step_size_warmup))
 
     for _ in range(n_steps):
         start_visible = visible.detach()
@@ -283,13 +327,18 @@ def _sample_state_hmc(
             visible=start_visible,
             beta=beta,
         )
-        current_kinetic = _kinetic_energy(start_momentum, mass=mass)
+        current_kinetic = _kinetic_energy(start_momentum, mass=mass_tensor)
 
         proposal_visible = start_visible
-        proposal_momentum = start_momentum - 0.5 * step_size * grad
+        proposal_momentum = start_momentum - 0.5 * adapted_step_size * grad
 
         for leapfrog_step in range(num_leapfrog_steps):
-            proposal_visible = proposal_visible + step_size * proposal_momentum / mass
+            proposal_visible = (
+                proposal_visible
+                + adapted_step_size
+                * proposal_momentum
+                / mass_tensor.reshape(1, -1)
+            )
 
             proposed_energy, grad = _energy_and_grad(
                 energy=energy,
@@ -298,12 +347,12 @@ def _sample_state_hmc(
             )
 
             if leapfrog_step != num_leapfrog_steps - 1:
-                proposal_momentum = proposal_momentum - step_size * grad
+                proposal_momentum = proposal_momentum - adapted_step_size * grad
 
-        proposal_momentum = proposal_momentum - 0.5 * step_size * grad
+        proposal_momentum = proposal_momentum - 0.5 * adapted_step_size * grad
         proposal_momentum = -proposal_momentum
 
-        proposed_kinetic = _kinetic_energy(proposal_momentum, mass=mass)
+        proposed_kinetic = _kinetic_energy(proposal_momentum, mass=mass_tensor)
         log_acceptance = (
             -proposed_energy
             - proposed_kinetic
@@ -319,13 +368,37 @@ def _sample_state_hmc(
                 start_visible,
             )
             acceptances.append(accept.float().mean())
+            if (
+                warmup_remaining > 0
+                and step_size_target is not None
+                and step_size_rate is not None
+            ):
+                adapted_step_size = _adapt_step_size(
+                    step_size=adapted_step_size,
+                    acceptance=acceptances[-1],
+                    target=step_size_target,
+                    rate=step_size_rate,
+                )
+                warmup_remaining -= 1
 
-    return {
+    sampled = {
         "visible": visible.detach(),
         "visible_mag": visible.detach(),
         "weights": weights,
         "acceptance": torch.stack(acceptances).mean() if acceptances else torch.nan,
     }
+    if step_size_warmup is not None:
+        sampled["step_size"] = torch.tensor(
+            adapted_step_size,
+            device=visible.device,
+            dtype=visible.dtype,
+        )
+        sampled["step_size_warmup"] = torch.tensor(
+            warmup_remaining,
+            device=visible.device,
+            dtype=torch.int64,
+        )
+    return sampled
 
 
 def _sample_state_nuts(
@@ -335,8 +408,11 @@ def _sample_state_nuts(
     beta: float = 1.0,
     step_size: float = 1e-2,
     num_leapfrog_steps: int = 64,
-    mass: float = 1.0,
+    mass: float | Tensor | None = None,
     max_delta_energy: float = 1000.0,
+    step_size_target: float | None = None,
+    step_size_rate: float | None = None,
+    step_size_warmup: int | None = None,
 ) -> dict[str, Tensor]:
     """Sample visible chains using No-U-Turn Sampler.
 
@@ -369,14 +445,14 @@ def _sample_state_nuts(
         raise ValueError(
             f"NUTS num_leapfrog_steps must be positive, got {num_leapfrog_steps}."
         )
-    if mass <= 0:
-        raise ValueError(f"NUTS mass must be positive, got {mass}.")
-
     visible = chains["visible"].clone()
     weights = chains["weights"].clone()
 
     max_tree_depth = max(1, int(math.ceil(math.log2(num_leapfrog_steps))))
-    momentum_std = mass**0.5
+    mass_tensor = _resolve_mass(energy=energy, visible=visible, mass=mass)
+    momentum_std = mass_tensor.sqrt().reshape(1, -1)
+    adapted_step_size = float(step_size)
+    warmup_remaining = 0 if step_size_warmup is None else max(0, int(step_size_warmup))
 
     acceptances = []
     tree_depths = []
@@ -394,7 +470,7 @@ def _sample_state_nuts(
         initial_log_joint = _log_joint(
             potential_energy=current_energy,
             momentum=start_momentum,
-            mass=mass,
+            mass=mass_tensor,
         )
 
         log_u = initial_log_joint + torch.log(torch.rand_like(initial_log_joint))
@@ -428,9 +504,9 @@ def _sample_state_nuts(
                     log_u=log_u,
                     direction=direction,
                     depth=depth,
-                    step_size=step_size,
+                    step_size=adapted_step_size,
                     beta=beta,
-                    mass=mass,
+                    mass=mass_tensor,
                     initial_log_joint=initial_log_joint,
                     max_delta_energy=max_delta_energy,
                 )
@@ -448,9 +524,9 @@ def _sample_state_nuts(
                     log_u=log_u,
                     direction=direction,
                     depth=depth,
-                    step_size=step_size,
+                    step_size=adapted_step_size,
                     beta=beta,
-                    mass=mass,
+                    mass=mass_tensor,
                     initial_log_joint=initial_log_joint,
                     max_delta_energy=max_delta_energy,
                 )
@@ -499,15 +575,39 @@ def _sample_state_nuts(
 
         transition_acceptance = acceptance_sum / torch.clamp(n_alpha, min=1.0)
         acceptances.append(transition_acceptance.mean())
+        if (
+            warmup_remaining > 0
+            and step_size_target is not None
+            and step_size_rate is not None
+        ):
+            adapted_step_size = _adapt_step_size(
+                step_size=adapted_step_size,
+                acceptance=acceptances[-1],
+                target=step_size_target,
+                rate=step_size_rate,
+            )
+            warmup_remaining -= 1
         tree_depths.append(depth_reached.float().mean())
 
-    return {
+    sampled = {
         "visible": visible.detach(),
         "visible_mag": visible.detach(),
         "weights": weights,
         "acceptance": torch.stack(acceptances).mean() if acceptances else torch.nan,
         "nuts_tree_depth": torch.stack(tree_depths).mean() if tree_depths else torch.nan,
     }
+    if step_size_warmup is not None:
+        sampled["step_size"] = torch.tensor(
+            adapted_step_size,
+            device=visible.device,
+            dtype=visible.dtype,
+        )
+        sampled["step_size_warmup"] = torch.tensor(
+            warmup_remaining,
+            device=visible.device,
+            dtype=torch.int64,
+        )
+    return sampled
 
 
 def sample_state(
@@ -518,8 +618,11 @@ def sample_state(
     beta: float = 1.0,
     step_size: float = 1e-2,
     num_leapfrog_steps: int = 10,
-    mass: float = 1.0,
+    mass: float | Tensor | None = None,
     max_delta_energy: float = 1000.0,
+    step_size_target: float | None = None,
+    step_size_rate: float | None = None,
+    step_size_warmup: int | None = None,
 ) -> dict[str, Tensor]:
     """Dispatch visible-state sampling.
 
@@ -538,6 +641,9 @@ def sample_state(
                 step_size=step_size,
                 num_leapfrog_steps=num_leapfrog_steps,
                 mass=mass,
+                step_size_target=step_size_target,
+                step_size_rate=step_size_rate,
+                step_size_warmup=step_size_warmup,
             )
 
         case "nuts":
@@ -550,6 +656,9 @@ def sample_state(
                 num_leapfrog_steps=num_leapfrog_steps,
                 mass=mass,
                 max_delta_energy=max_delta_energy,
+                step_size_target=step_size_target,
+                step_size_rate=step_size_rate,
+                step_size_warmup=step_size_warmup,
             )
 
         case _:

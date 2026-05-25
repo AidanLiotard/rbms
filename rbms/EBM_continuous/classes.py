@@ -41,6 +41,7 @@ class CEBM(EBM):
         self.flags = []
         self.last_acceptance: Tensor | None = None
         self.last_tree_depth: Tensor | None = None
+        self.last_step_size: Tensor | None = None
 
     def __add__(self, other: EBM) -> EBM:
         raise NotImplementedError("Addition of CEBMs is not implemented yet.")
@@ -201,7 +202,6 @@ class CEBM(EBM):
             num_visibles=num_visibles,
             data_mean=data_mean,
             data_std=data_std,
-            visible_field=data_mean,
         )
         return CEBM(energy=energy, num_visibles=num_visibles, device=device, dtype=dtype)
 
@@ -276,6 +276,7 @@ class CEBM(EBM):
                 )
                 self.last_acceptance = sampled.get("acceptance")
                 self.last_tree_depth = sampled.get("nuts_tree_depth")
+                self.last_step_size = sampled.get("step_size")
                 return sampled
             case "nuts":
                 sampled = _sample_state_nuts(
@@ -287,6 +288,7 @@ class CEBM(EBM):
                 )
                 self.last_acceptance = sampled.get("acceptance")
                 self.last_tree_depth = sampled.get("nuts_tree_depth")
+                self.last_step_size = sampled.get("step_size")
                 return sampled
             case _:
                 raise NotImplementedError(f"Unknown CEBM sampling kernel: {kernel}.")
@@ -296,6 +298,8 @@ class CEBM(EBM):
             metrics["hmc_acceptance"] = float(self.last_acceptance.detach().cpu())
         if self.last_tree_depth is not None:
             metrics["nuts_tree_depth"] = float(self.last_tree_depth.detach().cpu())
+        if self.last_step_size is not None:
+            metrics["hmc_step_size"] = float(self.last_step_size.detach().cpu())
         return metrics
 
     def pre_grad_update(self) -> None:
