@@ -92,17 +92,20 @@ class CEBM(EBM):
         weights: Tensor | None = None,
         start_v: Tensor | None = None,
     ) -> dict[str, Tensor]:
-        data_mean, data_std = self._get_base_stats()
-
         if start_v is None:
-            visible_field = self._get_visible_field()
-            init_mean = data_mean + data_std.square() * visible_field
+            if hasattr(self.energy, "sample_independent"):
+                visible = self.energy.sample_independent(num_samples)
+                visible = visible.to(device=self.device, dtype=self.dtype)
+            else:
+                data_mean, data_std = self._get_base_stats()
+                visible_field = self._get_visible_field()
+                init_mean = data_mean + data_std.square() * visible_field
 
-            visible = init_mean.view(1, -1) + data_std.view(1, -1) * torch.randn(
-                size=(num_samples, self.num_visibles),
-                device=self.device,
-                dtype=self.dtype,
-            )
+                visible = init_mean.view(1, -1) + data_std.view(1, -1) * torch.randn(
+                    size=(num_samples, self.num_visibles),
+                    device=self.device,
+                    dtype=self.dtype,
+                )
         else:
             visible = start_v.to(device=self.device, dtype=self.dtype)
 
@@ -268,6 +271,9 @@ class CEBM(EBM):
         return float(self.ref_log_z_beta0().detach().cpu())
 
     def ref_log_z_beta0(self) -> Tensor:
+        if hasattr(self.energy, "ref_log_z"):
+            return self.energy.ref_log_z.to(device=self.device, dtype=self.dtype)
+
         data_mean, data_std = self._get_base_stats()
         data_mean = data_mean.to(device=self.device, dtype=self.dtype).view(-1)
         data_std = data_std.to(device=self.device, dtype=self.dtype).view(-1)
@@ -381,6 +387,8 @@ class CEBM(EBM):
 
     def compute_base_energy(self, v: Tensor) -> Tensor:
         v = v.to(device=self.device, dtype=self.dtype)
+        if not hasattr(self.energy, "E_gauss"):
+            return torch.zeros(v.shape[0], device=v.device, dtype=v.dtype)
         return self.energy.E_gauss(v).view(-1)
 
     def compute_visible_field_energy(self, v: Tensor) -> Tensor:

@@ -572,6 +572,12 @@ def build_energy(
             f"Available energy types: {list(ENERGY_MAP.keys())}."
         )
     else:
+        if energy_type == "rbm":
+            hidden_dims = energy_kwargs.pop("hidden_dims", None)
+            if hidden_dims is not None:
+                energy_kwargs["num_hiddens"] = int(hidden_dims[0])
+            for key in ("data_mean", "data_std", "base_std_floor"):
+                energy_kwargs.pop(key, None)
         energy = ENERGY_MAP[energy_type](
             num_visibles=num_visibles,
             **energy_kwargs,
@@ -591,6 +597,8 @@ def restore_energy(
             energy = restore_mlp_energy(named_params)
         case "cnn":
             energy = restore_cnn_energy(named_params)
+        case "rbm":
+            energy = restore_rbm_energy(named_params)
         case _:
             raise ValueError(
                 f"Cannot restore unknown continuous energy type '{energy_type}'. "
@@ -616,6 +624,8 @@ def identify_energy_type(named_params: dict[str, np.ndarray]) -> str:
             return "cnn"
         case keys if any(name.startswith("net.") for name in keys):
             return "mlp"
+        case keys if {"visible_field", "hidden_bias", "weight"} <= keys:
+            return "rbm"
         case keys if {"data_mean", "data_std"} <= keys:
             return "gaussian"
         case _:
@@ -629,6 +639,15 @@ def restore_gaussian_energy(named_params: dict[str, np.ndarray]) -> GaussianBase
     return GaussianBaseEnergy(
         data_mean=torch.as_tensor(named_params["data_mean"]),
         data_std=torch.as_tensor(named_params["data_std"]),
+    )
+
+
+def restore_rbm_energy(named_params: dict[str, np.ndarray]) -> RBMEnergy:
+    return RBMEnergy(
+        num_visibles=named_params["visible_field"].shape[0],
+        num_hiddens=named_params["hidden_bias"].shape[0],
+        visible_field=torch.as_tensor(named_params["visible_field"]),
+        hidden_bias=torch.as_tensor(named_params["hidden_bias"]),
     )
 
 
