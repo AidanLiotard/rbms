@@ -454,7 +454,6 @@ class CNNEnergy(torch.nn.Module):
 ENERGY_MAP: dict[str, type[torch.nn.Module]] = {
     "mlp": MLPEnergy,
     "cnn": CNNEnergy,
-    "gaussian": GaussianBaseEnergy,
 }
 
 
@@ -489,13 +488,6 @@ def build_energy(
             f"Unknown continuous EBM energy type '{energy_type}'. "
             f"Available energy types: {list(ENERGY_MAP.keys())}."
         )
-
-    if energy_type == "gaussian":
-        energy = GaussianBaseEnergy(
-            data_mean=energy_kwargs["data_mean"],
-            data_std=energy_kwargs["data_std"],
-            std_floor=energy_kwargs.get("base_std_floor", 0.02),
-        )
     else:
         energy = ENERGY_MAP[energy_type](
             num_visibles=num_visibles,
@@ -512,8 +504,6 @@ def restore_energy(
     energy_type = identify_energy_type(named_params)
 
     match energy_type:
-        case "gaussian":
-            energy = restore_gaussian_energy(named_params)
         case "mlp":
             energy = restore_mlp_energy(named_params)
         case "cnn":
@@ -528,12 +518,6 @@ def restore_energy(
         name: torch.as_tensor(array, device=device, dtype=dtype)
         for name, array in named_params.items()
     }
-    if "visible_field" in energy.state_dict() and "visible_field" not in state_dict:
-        state_dict["visible_field"] = torch.zeros(
-            energy.num_visibles,
-            device=device,
-            dtype=dtype,
-        )
     energy.load_state_dict(state_dict)
     return energy.to(device=device, dtype=dtype)
 
@@ -583,7 +567,7 @@ def restore_mlp_energy(named_params: dict[str, np.ndarray]) -> MLPEnergy:
         hidden_dims=hidden_dims,
         data_mean=torch.as_tensor(named_params["base.data_mean"]),
         data_std=torch.as_tensor(named_params["base.data_std"]),
-        visible_field=torch.zeros(num_visibles),
+        visible_field=torch.as_tensor(named_params["visible_field"]),
         output_bias=final_bias_key in named_params,
     )
 
@@ -650,7 +634,7 @@ def restore_cnn_energy(named_params: dict[str, np.ndarray]) -> CNNEnergy:
         kernel_size=kernel_size,
         data_mean=data_mean,
         data_std=data_std,
-        visible_field=torch.zeros(num_visibles),
+        visible_field=torch.as_tensor(named_params["visible_field"]),
         output_bias=output_bias,
         architecture=architecture,
     )

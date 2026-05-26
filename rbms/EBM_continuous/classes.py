@@ -75,25 +75,16 @@ class CEBM(EBM):
     
     def __mul__(self, other: float) -> EBM:
         return self.interpolated_model(self.interpolation_beta * other)
+    __rmul__ = __mul__
     
     def __eq__(self, other: object) -> bool:
-        if not isinstance(other, EBM):
-            return False
-        other_params = other.named_parameters()
-        for k, v in self.named_parameters().items():
-            if not np.equal(other_params[k], v).all():
-                return False
-        if hasattr(other, "interpolation_beta") and not np.isclose(self.interpolation_beta, other.interpolation_beta):
-            return False
-        return True
+        raise NotImplementedError("Equality comparison is not implemented for CEBM.")
 
     def compute_energy_visibles(self, v: Tensor, beta: float | None = None) -> Tensor:
         v = v.to(device=self.device, dtype=self.dtype)
-        if hasattr(self.energy, "E_beta"):
-            if beta is None:
-                beta = self.interpolation_beta
-            return self.energy.E_beta(v, beta=beta).view(-1)
-        return self.energy(v).view(-1)
+        if beta is None:
+            beta = self.interpolation_beta
+        return self.energy.E_beta(v, beta=beta).view(-1)
 
     def init_chains(
         self,
@@ -102,21 +93,11 @@ class CEBM(EBM):
         start_v: Tensor | None = None,
     ) -> dict[str, Tensor]:
         data_mean, data_std = self._get_base_stats()
-        if num_samples <= 0:
-            if start_v is not None:
-                num_samples = start_v.shape[0]
-            else:
-                raise ValueError(f"Got negative num_samples arg: {num_samples}")
 
         if start_v is None:
-            # The analytic reference distribution for a beta=0 CEBM is
-            #   E_0(x) = 0.5 * ||(x - mu) / sigma||^2 - b^T x,
-            # hence x ~ N(mu + sigma^2 * b, diag(sigma^2)).
-            # For beta != 0 this is only an initialization distribution.
-            init_mean = data_mean
             visible_field = self._get_visible_field()
-            if visible_field is not None:
-                init_mean = data_mean + data_std.square() * visible_field
+            init_mean = data_mean + data_std.square() * visible_field
+
             visible = init_mean.view(1, -1) + data_std.view(1, -1) * torch.randn(
                 size=(num_samples, self.num_visibles),
                 device=self.device,
@@ -124,7 +105,6 @@ class CEBM(EBM):
             )
         else:
             visible = start_v.to(device=self.device, dtype=self.dtype)
-        mean_visible = visible
 
         if weights is None:
             weights = torch.ones(
@@ -137,7 +117,7 @@ class CEBM(EBM):
 
         return {
             "visible": visible,
-            "visible_mag": mean_visible,
+            "visible_mag": visible,
             "weights": weights,
         }
 
@@ -250,6 +230,7 @@ class CEBM(EBM):
         device: torch.device | str,
         dtype: torch.dtype,
         var_init: float = 1e-4,
+        base_std_floor: float = 0.02,
     ) -> EBM:
         from rbms.EBM_continuous.energies import MLPEnergy, get_gaussian_base_from_data
 
@@ -257,13 +238,21 @@ class CEBM(EBM):
             data=dataset.data,
             weights=dataset.weights,
         )
+
         energy = MLPEnergy(
             num_visibles=num_visibles,
             data_mean=data_mean,
             data_std=data_std,
+            base_std_floor=base_std_floor,
         )
-        return CEBM(energy=energy, num_visibles=num_visibles, device=device, dtype=dtype)
 
+        return CEBM(
+            energy=energy,
+            num_visibles=num_visibles,
+            device=device,
+            dtype=dtype,
+        )
+    
     @property
     def num_visibles(self) -> int:
         return self._num_visibles
@@ -279,28 +268,23 @@ class CEBM(EBM):
         return float(self.ref_log_z_beta0().detach().cpu())
 
     def ref_log_z_beta0(self) -> Tensor:
-        """Return log Z for E_0(x)=E_gauss(x)-visible_field^T x.
-
-        With diagonal Gaussian base parameters mu, sigma and field b,
-            log Z_0 = D/2 log(2*pi) + sum(log sigma)
-                      + b^T mu + 1/2 sum((sigma*b)^2).
-        If no visible field exists, b=0 and this reduces to the Gaussian logZ.
-        """
-
         data_mean, data_std = self._get_base_stats()
         data_mean = data_mean.to(device=self.device, dtype=self.dtype).view(-1)
         data_std = data_std.to(device=self.device, dtype=self.dtype).view(-1)
-        visible_field = self._get_visible_field()
-        if visible_field is None:
-            visible_field = torch.zeros_like(data_mean)
-        else:
-            visible_field = visible_field.to(device=self.device, dtype=self.dtype).view(-1)
+        visible_field = self._get_visible_field().to(
+            device=self.device,
+            dtype=self.dtype,
+        ).view(-1)
 
         log_two_pi = torch.log(
             torch.tensor(2.0 * torch.pi, device=self.device, dtype=self.dtype)
         )
+
         log_z_gauss = 0.5 * data_mean.numel() * log_two_pi + torch.log(data_std).sum()
-        field_shift = torch.dot(visible_field, data_mean) + 0.5 * (data_std * visible_field).square().sum()
+        field_shift = torch.dot(visible_field, data_mean) + 0.5 * (
+            data_std * visible_field
+        ).square().sum()
+
         return log_z_gauss + field_shift
 
     def independent_model(self) -> EBM:
@@ -397,36 +381,18 @@ class CEBM(EBM):
 
     def compute_base_energy(self, v: Tensor) -> Tensor:
         v = v.to(device=self.device, dtype=self.dtype)
-        if hasattr(self.energy, "E_gauss"):
-            return self.energy.E_gauss(v).view(-1)
-        return torch.zeros(v.shape[0], device=v.device, dtype=v.dtype)
+        return self.energy.E_gauss(v).view(-1)
 
     def compute_visible_field_energy(self, v: Tensor) -> Tensor:
         v = v.to(device=self.device, dtype=self.dtype)
-        if hasattr(self.energy, "E_visible_field"):
-            return self.energy.E_visible_field(v).view(-1)
-        visible_field = self._get_visible_field()
-        if visible_field is None:
-            return torch.zeros(v.shape[0], device=v.device, dtype=v.dtype)
-        return -(v @ visible_field.to(device=v.device, dtype=v.dtype).view(-1))
+        return self.energy.E_visible_field(v).view(-1)
 
     def compute_neural_energy(self, v: Tensor) -> Tensor:
         v = v.to(device=self.device, dtype=self.dtype)
-        if hasattr(self.energy, "E_nn"):
-            return self.energy.E_nn(v).view(-1)
-        return self.compute_energy_visibles(v) - self.compute_base_energy(v) - self.compute_visible_field_energy(v)
-
-    def _get_visible_field(self) -> Tensor | None:
-        if hasattr(self.energy, "visible_field"):
-            return self.energy.visible_field
-        return None
+        return self.energy.E_nn(v).view(-1)
+    
+    def _get_visible_field(self) -> Tensor:
+        return self.energy.visible_field
 
     def _get_base_stats(self) -> tuple[Tensor, Tensor]:
-        if hasattr(self.energy, "base"):
-            return self.energy.base.data_mean, self.energy.base.data_std
-        if hasattr(self.energy, "data_mean") and hasattr(self.energy, "data_std"):
-            return self.energy.data_mean, self.energy.data_std
-        return (
-            torch.zeros(self.num_visibles, device=self.device, dtype=self.dtype),
-            torch.ones(self.num_visibles, device=self.device, dtype=self.dtype),
-        )
+        return self.energy.base.data_mean, self.energy.base.data_std
