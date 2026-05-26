@@ -148,7 +148,12 @@ def _rescale_final_linear_to_target_std(
 
 
 class GaussianBaseEnergy(torch.nn.Module):
-    """Independent Gaussian reference energy for continuous visibles."""
+    """Pure independent Gaussian reference energy for continuous visibles.
+
+    This class intentionally has no neural residual and no visible field.
+    The beta=0 CEBM reference with visible field is represented by CEBM(beta=0),
+    not by this pure Gaussian utility class.
+    """
 
     def __init__(self, data_mean: Tensor, data_std: Tensor, std_floor: float = 0.2):
         super().__init__()
@@ -158,6 +163,9 @@ class GaussianBaseEnergy(torch.nn.Module):
         self.register_buffer("data_std", data_std.clone().clamp_min(self.std_floor))
 
     def forward(self, x: Tensor) -> Tensor:
+        return self.E_gauss(x)
+
+    def E_gauss(self, x: Tensor) -> Tensor:
         z = (x - self.data_mean) / self.data_std
         return 0.5 * z.square().sum(dim=1)
 
@@ -224,7 +232,19 @@ class MLPEnergy(torch.nn.Module):
         _init_mlp_layers(self.net)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.net(x).view(-1) + self.base(x) - x @ self.visible_field
+        return self.E_beta(x)
+
+    def E_gauss(self, x: Tensor) -> Tensor:
+        return self.base.E_gauss(x)
+
+    def E_visible_field(self, x: Tensor) -> Tensor:
+        return -x @ self.visible_field
+
+    def E_nn(self, x: Tensor) -> Tensor:
+        return self.net(x).view(-1)
+
+    def E_beta(self, x: Tensor, beta: float = 1.0) -> Tensor:
+        return self.E_gauss(x) + self.E_visible_field(x) + beta * self.E_nn(x)
 
     def calibrate_final_layer(
         self,
@@ -375,7 +395,19 @@ class CNNEnergy(torch.nn.Module):
         return self.head(features).view(-1)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self._score(x) + self.base(x) - x @ self.visible_field
+        return self.E_beta(x)
+
+    def E_gauss(self, x: Tensor) -> Tensor:
+        return self.base.E_gauss(x)
+
+    def E_visible_field(self, x: Tensor) -> Tensor:
+        return -x @ self.visible_field
+
+    def E_nn(self, x: Tensor) -> Tensor:
+        return self._score(x)
+
+    def E_beta(self, x: Tensor, beta: float = 1.0) -> Tensor:
+        return self.E_gauss(x) + self.E_visible_field(x) + beta * self.E_nn(x)
 
     def calibrate_final_layer(
         self,
@@ -618,7 +650,7 @@ def restore_cnn_energy(named_params: dict[str, np.ndarray]) -> CNNEnergy:
         kernel_size=kernel_size,
         data_mean=data_mean,
         data_std=data_std,
-        visible_field=torch.zeros(num_visibles) if "visible_field" not in named_params else None,
+        visible_field=torch.zeros(num_visibles),
         output_bias=output_bias,
         architecture=architecture,
     )

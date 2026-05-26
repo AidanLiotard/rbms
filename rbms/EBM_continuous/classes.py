@@ -10,6 +10,16 @@ from rbms.classes import EBM
 from rbms.EBM_continuous.implement import _sample_state_hmc, _sample_state_nuts
 
 
+class _ModelEnergyProxy(torch.nn.Module):
+    def __init__(self, model: "CEBM"):
+        super().__init__()
+        self.model = model
+        self.base = getattr(model.energy, "base", model.energy)
+
+    def forward(self, v: Tensor) -> Tensor:
+        return self.model.compute_energy_visibles(v)
+
+
 class CEBM(EBM):
     """Continuous visible-state energy-based model."""
 
@@ -25,6 +35,7 @@ class CEBM(EBM):
         num_visibles: int,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
+        beta: float = 1.0,
     ):
         first_param = next(energy.parameters(), None)
 
@@ -42,13 +53,14 @@ class CEBM(EBM):
         self.last_acceptance: Tensor | None = None
         self.last_tree_depth: Tensor | None = None
         self.last_step_size: Tensor | None = None
+        self.beta = float(beta)
 
     def __add__(self, other: EBM) -> EBM:
-        raise NotImplementedError("Addition of CEBMs is not implemented yet.")
-
+        return self.interpolated_model(self.beta + other.beta)
+    
     def __mul__(self, other: float) -> EBM:
-        raise NotImplementedError("Multiplication of CEBMs is not implemented yet.")
-
+        return self.interpolated_model(self.beta * other)
+    
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, EBM):
             return False
@@ -56,10 +68,16 @@ class CEBM(EBM):
         for k, v in self.named_parameters().items():
             if not np.equal(other_params[k], v).all():
                 return False
+        if hasattr(other, "beta") and not np.isclose(self.beta, other.beta):
+            return False
         return True
 
-    def compute_energy_visibles(self, v: Tensor) -> Tensor:
+    def compute_energy_visibles(self, v: Tensor, beta: float | None = None) -> Tensor:
         v = v.to(device=self.device, dtype=self.dtype)
+        if hasattr(self.energy, "E_beta"):
+            if beta is None:
+                beta = self.beta
+            return self.energy.E_beta(v, beta=beta).view(-1)
         return self.energy(v).view(-1)
 
     def init_chains(
@@ -76,7 +94,15 @@ class CEBM(EBM):
                 raise ValueError(f"Got negative num_samples arg: {num_samples}")
 
         if start_v is None:
-            visible = data_mean.view(1, -1) + data_std.view(1, -1) * torch.randn(
+            # The analytic reference distribution for a beta=0 CEBM is
+            #   E_0(x) = 0.5 * ||(x - mu) / sigma||^2 - b^T x,
+            # hence x ~ N(mu + sigma^2 * b, diag(sigma^2)).
+            # For beta != 0 this is only an initialization distribution.
+            init_mean = data_mean
+            visible_field = self._get_visible_field()
+            if visible_field is not None:
+                init_mean = data_mean + data_std.square() * visible_field
+            visible = init_mean.view(1, -1) + data_std.view(1, -1) * torch.randn(
                 size=(num_samples, self.num_visibles),
                 device=self.device,
                 dtype=self.dtype,
@@ -114,8 +140,8 @@ class CEBM(EBM):
         data_weights = w_data / w_data.sum()
         chain_weights = w_chain / w_chain.sum()
 
-        data_energy = self.energy(v_data).view(-1)
-        chain_energy = self.energy(v_chain).view(-1)
+        data_energy = self.compute_energy_visibles(v_data)
+        chain_energy = self.compute_energy_visibles(v_chain)
 
         objective = -(data_energy * data_weights).sum() + (
             chain_energy * chain_weights
@@ -128,10 +154,12 @@ class CEBM(EBM):
         return list(self.energy.parameters())
 
     def named_parameters(self) -> dict[str, np.ndarray]:
-        return {
+        named_params = {
             name: tensor.detach().cpu().numpy()
             for name, tensor in self.energy.state_dict().items()
         }
+        named_params["beta"] = np.asarray(self.beta)
+        return named_params
 
     @staticmethod
     def set_named_parameters(
@@ -141,6 +169,8 @@ class CEBM(EBM):
     ) -> EBM:
         from rbms.EBM_continuous.energies import restore_energy
 
+        named_params = dict(named_params)
+        beta = float(named_params.pop("beta", 1.0))
         energy = restore_energy(
             named_params=named_params,
             device=device,
@@ -152,6 +182,7 @@ class CEBM(EBM):
             num_visibles=energy.num_visibles,
             device=device,
             dtype=dtype,
+            beta=beta,
         )
 
     def to(
@@ -182,7 +213,20 @@ class CEBM(EBM):
             num_visibles=self.num_visibles,
             device=device,
             dtype=dtype,
+            beta=self.beta,
         )
+
+    def interpolated_model(self, beta: float) -> "CEBM":
+        """Return the same CEBM energy family at interpolation value beta.
+
+        The intended decomposition is
+            E_beta(x) = E_gauss(x) + E_visible_field(x) + beta * E_nn(x).
+        beta=0 is the independent CEBM reference, beta=1 is the full model.
+        """
+
+        new = self.clone(device=self.device, dtype=self.dtype)
+        new.beta = float(beta)
+        return new
 
     @staticmethod
     def init_parameters(
@@ -211,25 +255,47 @@ class CEBM(EBM):
 
     @property
     def ref_log_z(self) -> float:
-        independent = self.independent_model()
-        return independent.energy.log_z.item()
+        """Analytic log partition function of the beta=0 reference model.
 
-    def independent_model(self) -> EBM:
-        from rbms.EBM_continuous.energies import GaussianBaseEnergy
+        This is not the logZ of the full beta=1 CEBM. It is the reference
+        normalizer used for beta-ladder AIS/PTT estimates.
+        """
+
+        return float(self.ref_log_z_beta0().detach().cpu())
+
+    def ref_log_z_beta0(self) -> Tensor:
+        """Return log Z for E_0(x)=E_gauss(x)-visible_field^T x.
+
+        With diagonal Gaussian base parameters mu, sigma and field b,
+            log Z_0 = D/2 log(2*pi) + sum(log sigma)
+                      + b^T mu + 1/2 sum((sigma*b)^2).
+        If no visible field exists, b=0 and this reduces to the Gaussian logZ.
+        """
 
         data_mean, data_std = self._get_base_stats()
-        std_floor = getattr(getattr(self.energy, "base", self.energy), "std_floor", 0.2)
-        energy = GaussianBaseEnergy(
-            data_mean=data_mean.detach().clone(),
-            data_std=data_std.detach().clone(),
-            std_floor=std_floor,
+        data_mean = data_mean.to(device=self.device, dtype=self.dtype).view(-1)
+        data_std = data_std.to(device=self.device, dtype=self.dtype).view(-1)
+        visible_field = self._get_visible_field()
+        if visible_field is None:
+            visible_field = torch.zeros_like(data_mean)
+        else:
+            visible_field = visible_field.to(device=self.device, dtype=self.dtype).view(-1)
+
+        log_two_pi = torch.log(
+            torch.tensor(2.0 * torch.pi, device=self.device, dtype=self.dtype)
         )
-        return CEBM(
-            energy=energy,
-            num_visibles=self.num_visibles,
-            device=self.device,
-            dtype=self.dtype,
-        )
+        log_z_gauss = 0.5 * data_mean.numel() * log_two_pi + torch.log(data_std).sum()
+        field_shift = torch.dot(visible_field, data_mean) + 0.5 * (data_std * visible_field).square().sum()
+        return log_z_gauss + field_shift
+
+    def independent_model(self) -> EBM:
+        """Return the independent CEBM: beta=0 with visible field kept.
+
+        This mirrors the independent RBM convention: local fields/biases remain,
+        while the interaction/neural residual term is removed.
+        """
+
+        return self.interpolated_model(beta=0.0)
 
     def sample_state(
         self,
@@ -265,10 +331,12 @@ class CEBM(EBM):
             "weights": chains["weights"].clone(),
         }
 
+        tempered_energy = _ModelEnergyProxy(self)
+
         match kernel:
             case "hmc":
                 sampled = _sample_state_hmc(
-                    energy=self.energy,
+                    energy=tempered_energy,
                     chains=new_chains,
                     n_steps=n_steps,
                     beta=beta,
@@ -280,7 +348,7 @@ class CEBM(EBM):
                 return sampled
             case "nuts":
                 sampled = _sample_state_nuts(
-                    energy=self.energy,
+                    energy=tempered_energy,
                     chains=new_chains,
                     n_steps=n_steps,
                     beta=beta,
@@ -311,6 +379,32 @@ class CEBM(EBM):
     @property
     def effective_number_variables(self) -> float:
         return self.num_visibles
+
+    def compute_base_energy(self, v: Tensor) -> Tensor:
+        v = v.to(device=self.device, dtype=self.dtype)
+        if hasattr(self.energy, "E_gauss"):
+            return self.energy.E_gauss(v).view(-1)
+        return torch.zeros(v.shape[0], device=v.device, dtype=v.dtype)
+
+    def compute_visible_field_energy(self, v: Tensor) -> Tensor:
+        v = v.to(device=self.device, dtype=self.dtype)
+        if hasattr(self.energy, "E_visible_field"):
+            return self.energy.E_visible_field(v).view(-1)
+        visible_field = self._get_visible_field()
+        if visible_field is None:
+            return torch.zeros(v.shape[0], device=v.device, dtype=v.dtype)
+        return -(v @ visible_field.to(device=v.device, dtype=v.dtype).view(-1))
+
+    def compute_neural_energy(self, v: Tensor) -> Tensor:
+        v = v.to(device=self.device, dtype=self.dtype)
+        if hasattr(self.energy, "E_nn"):
+            return self.energy.E_nn(v).view(-1)
+        return self.compute_energy_visibles(v) - self.compute_base_energy(v) - self.compute_visible_field_energy(v)
+
+    def _get_visible_field(self) -> Tensor | None:
+        if hasattr(self.energy, "visible_field"):
+            return self.energy.visible_field
+        return None
 
     def _get_base_stats(self) -> tuple[Tensor, Tensor]:
         if hasattr(self.energy, "base"):
