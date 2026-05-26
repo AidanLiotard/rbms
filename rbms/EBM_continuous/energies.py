@@ -449,11 +449,94 @@ class CNNEnergy(torch.nn.Module):
                 return float(scale.detach().cpu())
 
         return 1.0
+    
+
+class RBMEnergy(torch.nn.Module):
+    """Binary visible-state RBM marginal energy.
+
+    Decomposition:
+
+        E_beta(x) = E_visible_field(x) + beta * E_nn(x)
+
+    with
+
+        E_visible_field(x) = -x^T a
+        E_nn(x) = -sum_j softplus(b_j + x^T W_j)
+
+    where x is expected to be binary or in [0, 1].
+    """
+
+    def __init__(
+        self,
+        num_visibles: int,
+        num_hiddens: int = 256,
+        visible_field: Tensor | None = None,
+        hidden_bias: Tensor | None = None,
+        weight_scale: float = 1e-3,
+    ):
+        super().__init__()
+
+        self.num_visibles = int(num_visibles)
+        self.num_hiddens = int(num_hiddens)
+
+        if visible_field is None:
+            visible_field = torch.zeros(num_visibles)
+
+        if hidden_bias is None:
+            hidden_bias = torch.zeros(num_hiddens)
+
+        self.visible_field = torch.nn.Parameter(visible_field.clone())
+        self.hidden_bias = torch.nn.Parameter(hidden_bias.clone())
+
+        self.weight = torch.nn.Parameter(
+            weight_scale
+            * torch.randn(
+                self.num_hiddens,
+                self.num_visibles,
+                device=visible_field.device,
+                dtype=visible_field.dtype,
+            )
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.E_beta(x)
+
+    def E_visible_field(self, x: Tensor) -> Tensor:
+        return -x @ self.visible_field
+
+    def E_nn(self, x: Tensor) -> Tensor:
+        hidden_pre_activation = x @ self.weight.T + self.hidden_bias
+        return -torch.nn.functional.softplus(hidden_pre_activation).sum(dim=1)
+
+    def E_beta(self, x: Tensor, beta: float = 1.0) -> Tensor:
+        return self.E_visible_field(x) + beta * self.E_nn(x)
+
+    @property
+    def ref_log_z(self) -> Tensor:
+        """log Z for beta=0, i.e. independent Bernoulli visibles.
+
+        E_0(x) = -x^T a, x in {0, 1}^D
+
+        Z_0 = prod_i (1 + exp(a_i))
+        log Z_0 = sum_i softplus(a_i)
+        """
+        return torch.nn.functional.softplus(self.visible_field).sum()
+
+    def sample_independent(
+        self,
+        num_samples: int,
+    ) -> Tensor:
+        """Exact samples from beta=0 independent visible model."""
+        probs = torch.sigmoid(self.visible_field)
+        return torch.bernoulli(
+            probs.view(1, -1).expand(num_samples, -1)
+        )
 
 
 ENERGY_MAP: dict[str, type[torch.nn.Module]] = {
     "mlp": MLPEnergy,
     "cnn": CNNEnergy,
+    "rbm": RBMEnergy,
 }
 
 
