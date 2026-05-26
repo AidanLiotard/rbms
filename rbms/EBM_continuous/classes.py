@@ -36,6 +36,7 @@ class CEBM(EBM):
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
         beta: float = 1.0,
+        interpolation_beta: float | None = None,
     ):
         first_param = next(energy.parameters(), None)
 
@@ -53,13 +54,27 @@ class CEBM(EBM):
         self.last_acceptance: Tensor | None = None
         self.last_tree_depth: Tensor | None = None
         self.last_step_size: Tensor | None = None
-        self.beta = float(beta)
+        self.interpolation_beta = float(beta if interpolation_beta is None else interpolation_beta)
+
+
+    @property
+    def beta(self) -> float:
+        """Backward-compatible alias for the CEBM interpolation coefficient.
+
+        Prefer `interpolation_beta` in new code, because `beta` is also used
+        as the sampler inverse-temperature argument in `sample_state`.
+        """
+        return self.interpolation_beta
+
+    @beta.setter
+    def beta(self, value: float) -> None:
+        self.interpolation_beta = float(value)
 
     def __add__(self, other: EBM) -> EBM:
-        return self.interpolated_model(self.beta + other.beta)
+        return self.interpolated_model(self.interpolation_beta + other.interpolation_beta)
     
     def __mul__(self, other: float) -> EBM:
-        return self.interpolated_model(self.beta * other)
+        return self.interpolated_model(self.interpolation_beta * other)
     
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, EBM):
@@ -68,7 +83,7 @@ class CEBM(EBM):
         for k, v in self.named_parameters().items():
             if not np.equal(other_params[k], v).all():
                 return False
-        if hasattr(other, "beta") and not np.isclose(self.beta, other.beta):
+        if hasattr(other, "interpolation_beta") and not np.isclose(self.interpolation_beta, other.interpolation_beta):
             return False
         return True
 
@@ -76,7 +91,7 @@ class CEBM(EBM):
         v = v.to(device=self.device, dtype=self.dtype)
         if hasattr(self.energy, "E_beta"):
             if beta is None:
-                beta = self.beta
+                beta = self.interpolation_beta
             return self.energy.E_beta(v, beta=beta).view(-1)
         return self.energy(v).view(-1)
 
@@ -158,7 +173,7 @@ class CEBM(EBM):
             name: tensor.detach().cpu().numpy()
             for name, tensor in self.energy.state_dict().items()
         }
-        named_params["beta"] = np.asarray(self.beta)
+        named_params["interpolation_beta"] = np.asarray(self.interpolation_beta)
         return named_params
 
     @staticmethod
@@ -170,7 +185,7 @@ class CEBM(EBM):
         from rbms.EBM_continuous.energies import restore_energy
 
         named_params = dict(named_params)
-        beta = float(named_params.pop("beta", 1.0))
+        beta = float(named_params.pop("interpolation_beta", named_params.pop("beta", 1.0)))
         energy = restore_energy(
             named_params=named_params,
             device=device,
@@ -182,7 +197,7 @@ class CEBM(EBM):
             num_visibles=energy.num_visibles,
             device=device,
             dtype=dtype,
-            beta=beta,
+            interpolation_beta=beta,
         )
 
     def to(
@@ -213,7 +228,7 @@ class CEBM(EBM):
             num_visibles=self.num_visibles,
             device=device,
             dtype=dtype,
-            beta=self.beta,
+            interpolation_beta=self.interpolation_beta,
         )
 
     def interpolated_model(self, beta: float) -> "CEBM":
@@ -221,11 +236,11 @@ class CEBM(EBM):
 
         The intended decomposition is
             E_beta(x) = E_gauss(x) + E_visible_field(x) + beta * E_nn(x).
-        beta=0 is the independent CEBM reference, beta=1 is the full model.
+        interpolation_beta=0 is the independent CEBM reference, interpolation_beta=1 is the full model.
         """
 
         new = self.clone(device=self.device, dtype=self.dtype)
-        new.beta = float(beta)
+        new.interpolation_beta = float(beta)
         return new
 
     @staticmethod
