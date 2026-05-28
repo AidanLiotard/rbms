@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-from torch import Tensor
+from torch import Tensor 
 
 
 def _normalize_hidden_dims(
@@ -147,42 +147,8 @@ def _rescale_final_linear_to_target_std(
     return 1.0
 
 
-class GaussianBaseEnergy(torch.nn.Module):
-    """Pure independent Gaussian reference energy for continuous visibles.
-
-    This class intentionally has no neural residual and no visible field.
-    The beta=0 CEBM reference with visible field is represented by CEBM(beta=0),
-    not by this pure Gaussian utility class.
-    """
-
-    def __init__(self, data_mean: Tensor, data_std: Tensor, std_floor: float = 0.2):
-        super().__init__()
-        self.num_visibles = data_mean.shape[0]
-        self.std_floor = float(std_floor)
-        self.register_buffer("data_mean", data_mean.clone())
-        self.register_buffer("data_std", data_std.clone().clamp_min(self.std_floor))
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.E_gauss(x)
-
-    def E_gauss(self, x: Tensor) -> Tensor:
-        z = (x - self.data_mean) / self.data_std
-        return 0.5 * z.square().sum(dim=1)
-
-    @property
-    def log_z(self) -> Tensor:
-        log_two_pi = torch.log(
-            torch.tensor(2.0 * torch.pi, device=self.data_std.device, dtype=self.data_std.dtype)
-        )
-        return 0.5 * self.num_visibles * log_two_pi + torch.log(self.data_std).sum()
-
-
 class MLPEnergy(torch.nn.Module):
-    """Continuous visible-state energy represented by an MLP plus Gaussian tails.
-
-    A learnable visible field h contributes the linear term -x^T h.
-    """
-
+    """Continuous visible-state energy: Gaussian base + visible field + MLP residual."""
     def __init__(
         self,
         num_visibles: int,
@@ -196,7 +162,7 @@ class MLPEnergy(torch.nn.Module):
         output_bias: bool = False,
     ):
         super().__init__()
-        self.num_visibles = num_visibles
+        self.num_visibles = int(num_visibles)
         self.hidden_dims = _normalize_hidden_dims(
             hidden_dims=hidden_dims,
             hidden_dim=hidden_dim,
@@ -204,21 +170,22 @@ class MLPEnergy(torch.nn.Module):
         )
         self.hidden_dim = self.hidden_dims[-1]
         self.num_layers = len(self.hidden_dims)
+        self.base_std_floor = float(base_std_floor)
 
         if data_mean is None:
             data_mean = torch.zeros(num_visibles)
         if data_std is None:
             data_std = torch.ones(num_visibles)
         if visible_field is None:
-            visible_field = torch.zeros(num_visibles, device=data_mean.device, dtype=data_mean.dtype)
-        self.visible_field = torch.nn.Parameter(visible_field.clone())
+            visible_field = torch.zeros(
+                num_visibles,
+                device=data_mean.device,
+                dtype=data_mean.dtype,
+            )
 
-        self.base_std_floor = float(base_std_floor)
-        self.base = GaussianBaseEnergy(
-            data_mean=data_mean,
-            data_std=data_std,
-            std_floor=self.base_std_floor,
-        )
+        self.register_buffer("data_mean", data_mean.clone())
+        self.register_buffer("data_std", data_std.clone().clamp_min(self.base_std_floor))
+        self.visible_field = torch.nn.Parameter(visible_field.clone())
 
         layers = []
         in_dim = num_visibles
@@ -231,11 +198,19 @@ class MLPEnergy(torch.nn.Module):
         self.net = torch.nn.Sequential(*layers)
         _init_mlp_layers(self.net)
 
+    @property
+    def visible_std(self) -> Tensor:
+        return self.data_std
+
     def forward(self, x: Tensor) -> Tensor:
         return self.E_beta(x)
 
+    def E_visible_gaussian(self, x: Tensor) -> Tensor:
+        z = (x - self.data_mean) / self.data_std
+        return 0.5 * z.square().sum(dim=1)
+
     def E_gauss(self, x: Tensor) -> Tensor:
-        return self.base.E_gauss(x)
+        return self.E_visible_gaussian(x)
 
     def E_visible_field(self, x: Tensor) -> Tensor:
         return -x @ self.visible_field
@@ -244,7 +219,30 @@ class MLPEnergy(torch.nn.Module):
         return self.net(x).view(-1)
 
     def E_beta(self, x: Tensor, beta: float = 1.0) -> Tensor:
-        return self.E_gauss(x) + self.E_visible_field(x) + beta * self.E_nn(x)
+        return self.E_visible_gaussian(x) + self.E_visible_field(x) + beta * self.E_nn(x)
+
+    @property
+    def ref_log_z(self) -> Tensor:
+        std = self.data_std
+        log_two_pi = torch.log(
+            torch.as_tensor(2.0 * torch.pi, device=std.device, dtype=std.dtype)
+        )
+        log_z_gauss = 0.5 * self.num_visibles * log_two_pi + torch.log(std).sum()
+        field_shift = torch.dot(self.visible_field, self.data_mean) + 0.5 * (
+            std * self.visible_field
+        ).square().sum()
+        return log_z_gauss + field_shift
+
+    def sample_independent(self, num_samples: int) -> Tensor:
+        std = self.data_std
+        mean = self.data_mean + std.square() * self.visible_field
+        eps = torch.randn(
+            num_samples,
+            self.num_visibles,
+            device=std.device,
+            dtype=std.dtype,
+        )
+        return mean.view(1, -1) + std.view(1, -1) * eps
 
     def calibrate_final_layer(
         self,
@@ -263,10 +261,7 @@ class MLPEnergy(torch.nn.Module):
 
 
 class CNNEnergy(torch.nn.Module):
-    """Continuous flattened-image energy represented by a small CNN.
-
-    A learnable visible field h contributes the linear term -x^T h.
-    """
+    """Continuous flattened-image energy: Gaussian base + visible field + CNN residual."""
 
     def __init__(
         self,
@@ -284,6 +279,7 @@ class CNNEnergy(torch.nn.Module):
         architecture: str = "residual",
     ):
         super().__init__()
+
         self.num_visibles = int(num_visibles)
         self.architecture = architecture
         self.hidden_dims = _normalize_hidden_dims(
@@ -294,42 +290,50 @@ class CNNEnergy(torch.nn.Module):
         self.hidden_dim = self.hidden_dims[-1]
         self.num_layers = len(self.hidden_dims)
         self.kernel_size = int(kernel_size)
+        self.base_std_floor = float(base_std_floor)
+
         if self.kernel_size <= 0 or self.kernel_size % 2 == 0:
             raise ValueError(f"kernel_size must be a positive odd integer, got {kernel_size}.")
 
         if image_shape is None:
             image_shape = _infer_square_image_shape(self.num_visibles)
+
         image_shape = tuple(int(dim) for dim in image_shape)
+
         if len(image_shape) != 2 or any(dim <= 0 for dim in image_shape):
             raise ValueError(f"image_shape must be a positive (height, width), got {image_shape}.")
+
         if image_shape[0] * image_shape[1] != self.num_visibles:
             raise ValueError(
-                f"image_shape={image_shape} is incompatible with num_visibles={self.num_visibles}."
+                f"image_shape={image_shape} is incompatible with "
+                f"num_visibles={self.num_visibles}."
             )
+
         self.image_shape = image_shape
-        self.register_buffer(
-            "_image_shape",
-            torch.tensor(image_shape, dtype=torch.int64),
-        )
+        self.register_buffer("_image_shape", torch.tensor(image_shape, dtype=torch.int64))
 
         if data_mean is None:
             data_mean = torch.zeros(self.num_visibles)
+
         if data_std is None:
             data_std = torch.ones(self.num_visibles)
+
         if visible_field is None:
-            visible_field = torch.zeros(self.num_visibles, device=data_mean.device, dtype=data_mean.dtype)
+            visible_field = torch.zeros(
+                self.num_visibles,
+                device=data_mean.device,
+                dtype=data_mean.dtype,
+            )
+
+        self.register_buffer("data_mean", data_mean.clone())
+        self.register_buffer("data_std", data_std.clone().clamp_min(self.base_std_floor))
+
         self.visible_field = torch.nn.Parameter(visible_field.clone())
-        
-        self.base_std_floor = float(base_std_floor)
-        self.base = GaussianBaseEnergy(
-            data_mean=data_mean,
-            data_std=data_std,
-            std_floor=self.base_std_floor,
-        )
 
         if architecture == "legacy":
             conv_layers = []
             in_channels = 1
+
             for out_channels in self.hidden_dims:
                 conv_layers.append(
                     torch.nn.Conv2d(
@@ -345,7 +349,9 @@ class CNNEnergy(torch.nn.Module):
             self.conv = torch.nn.Sequential(*conv_layers)
             self.pool = torch.nn.AdaptiveAvgPool2d(output_size=1)
             self.head = torch.nn.Linear(in_channels, 1, bias=output_bias)
+
             _init_cnn_layers(self.conv, self.head)
+
         else:
             self.stem = torch.nn.Conv2d(
                 1,
@@ -353,8 +359,10 @@ class CNNEnergy(torch.nn.Module):
                 kernel_size=self.kernel_size,
                 padding=self.kernel_size // 2,
             )
+
             blocks = []
             in_channels = self.hidden_dims[0]
+
             for idx, out_channels in enumerate(self.hidden_dims):
                 blocks.append(
                     _ResidualDownsampleBlock(
@@ -365,40 +373,61 @@ class CNNEnergy(torch.nn.Module):
                     )
                 )
                 in_channels = out_channels
+
             self.blocks = torch.nn.ModuleList(blocks)
+
             with torch.no_grad():
                 dummy = torch.zeros(1, 1, *self.image_shape)
                 dummy_features = self.stem(dummy)
+
                 for block in self.blocks:
                     dummy_features = block(dummy_features)
+
                 flattened_dim = dummy_features.flatten(start_dim=1).shape[1]
+
             head_layers: list[torch.nn.Module] = []
             head_hidden_dims = self.hidden_dims[1:] or [self.hidden_dims[0]]
             head_in_dim = flattened_dim
+
             for head_out_dim in head_hidden_dims:
                 head_layers.append(torch.nn.Linear(head_in_dim, head_out_dim))
                 head_layers.append(torch.nn.SiLU())
                 head_in_dim = head_out_dim
+
             head_layers.append(torch.nn.Linear(head_in_dim, 1, bias=output_bias))
+
             self.head = torch.nn.Sequential(*head_layers)
+
             _init_cnn_layers(self.stem, self.blocks, self.head)
+
+    @property
+    def visible_std(self) -> Tensor:
+        return self.data_std
 
     def _score(self, x: Tensor) -> Tensor:
         image = x.view(x.shape[0], 1, *self.image_shape)
+
         if self.architecture == "legacy":
             features = self.pool(self.conv(image)).flatten(start_dim=1)
         else:
             features = self.stem(image)
+
             for block in self.blocks:
                 features = block(features)
+
             features = features.flatten(start_dim=1)
+
         return self.head(features).view(-1)
 
     def forward(self, x: Tensor) -> Tensor:
         return self.E_beta(x)
 
+    def E_visible_gaussian(self, x: Tensor) -> Tensor:
+        z = (x - self.data_mean) / self.data_std
+        return 0.5 * z.square().sum(dim=1)
+
     def E_gauss(self, x: Tensor) -> Tensor:
-        return self.base.E_gauss(x)
+        return self.E_visible_gaussian(x)
 
     def E_visible_field(self, x: Tensor) -> Tensor:
         return -x @ self.visible_field
@@ -407,7 +436,36 @@ class CNNEnergy(torch.nn.Module):
         return self._score(x)
 
     def E_beta(self, x: Tensor, beta: float = 1.0) -> Tensor:
-        return self.E_gauss(x) + self.E_visible_field(x) + beta * self.E_nn(x)
+        return (
+            self.E_visible_gaussian(x)
+            + self.E_visible_field(x)
+            + beta * self.E_nn(x)
+        )
+
+    @property
+    def ref_log_z(self) -> Tensor:
+        std = self.data_std
+        log_two_pi = torch.log(
+            torch.as_tensor(2.0 * torch.pi, device=std.device, dtype=std.dtype)
+        )
+        log_z_gauss = 0.5 * self.num_visibles * log_two_pi + torch.log(std).sum()
+        field_shift = torch.dot(self.visible_field, self.data_mean) + 0.5 * (
+            std * self.visible_field
+        ).square().sum()
+        return log_z_gauss + field_shift
+
+    def sample_independent(self, num_samples: int) -> Tensor:
+        std = self.data_std
+        mean = self.data_mean + std.square() * self.visible_field
+
+        eps = torch.randn(
+            num_samples,
+            self.num_visibles,
+            device=std.device,
+            dtype=std.dtype,
+        )
+
+        return mean.view(1, -1) + std.view(1, -1) * eps
 
     def calibrate_final_layer(
         self,
@@ -417,24 +475,32 @@ class CNNEnergy(torch.nn.Module):
         batch_size: int = 4096,
         eps: float = 1e-12,
     ) -> float:
-        linear_layers = [module for module in self.head.modules() if isinstance(module, torch.nn.Linear)]
+        linear_layers = [
+            module for module in self.head.modules()
+            if isinstance(module, torch.nn.Linear)
+        ]
         final_layer = linear_layers[-1]
         device = final_layer.weight.device
         dtype = final_layer.weight.dtype
+
         data = data.to(device=device, dtype=dtype)
+
         if weights is not None:
             weights = weights.to(device=device, dtype=dtype).view(-1)
 
         outputs = []
         weight_chunks = []
+
         with torch.no_grad():
             for start in range(0, data.shape[0], batch_size):
                 stop = min(start + batch_size, data.shape[0])
                 outputs.append(self._score(data[start:stop]))
+
                 if weights is not None:
                     weight_chunks.append(weights[start:stop])
 
             values = torch.cat(outputs)
+
             if weights is None:
                 current_std = values.std(unbiased=False)
             else:
@@ -451,39 +517,46 @@ class CNNEnergy(torch.nn.Module):
         return 1.0
     
 
+@torch.compile
 class RBMEnergy(torch.nn.Module):
-    """Binary visible-state RBM marginal energy.
-
-    Decomposition:
-
-        E_beta(x) = E_visible_field(x) + beta * E_nn(x)
-
-    with
-
-        E_visible_field(x) = -x^T a
-        E_nn(x) = -sum_j softplus(b_j + x^T W_j)
-
-    where x is expected to be binary or in [0, 1].
+    """Fixed-variance Gaussian-visible / Bernoulli-hidden RBM.
     """
 
     def __init__(
         self,
         num_visibles: int,
         num_hiddens: int = 256,
+        log_visible_std: Tensor | None = None,
         visible_field: Tensor | None = None,
         hidden_bias: Tensor | None = None,
         weight_scale: float = 1e-3,
+        min_std: float = 1e-4,
+        **_,
     ):
         super().__init__()
 
         self.num_visibles = int(num_visibles)
         self.num_hiddens = int(num_hiddens)
+        self.min_std = float(min_std)
+
+        if log_visible_std is None:
+            log_visible_std = torch.zeros(num_visibles)
 
         if visible_field is None:
-            visible_field = torch.zeros(num_visibles)
+            visible_field = torch.zeros(
+                num_visibles,
+                device=log_visible_std.device,
+                dtype=log_visible_std.dtype,
+            )
 
         if hidden_bias is None:
-            hidden_bias = torch.zeros(num_hiddens)
+            hidden_bias = torch.zeros(
+                num_hiddens,
+                device=log_visible_std.device,
+                dtype=log_visible_std.dtype,
+            )
+
+        self.register_buffer("log_visible_std", log_visible_std.clone())
 
         self.visible_field = torch.nn.Parameter(visible_field.clone())
         self.hidden_bias = torch.nn.Parameter(hidden_bias.clone())
@@ -493,13 +566,22 @@ class RBMEnergy(torch.nn.Module):
             * torch.randn(
                 self.num_hiddens,
                 self.num_visibles,
-                device=visible_field.device,
-                dtype=visible_field.dtype,
+                device=log_visible_std.device,
+                dtype=log_visible_std.dtype,
             )
         )
 
+    @property
+    def visible_std(self) -> Tensor:
+        return torch.nn.functional.softplus(self.log_visible_std) + self.min_std
+
     def forward(self, x: Tensor) -> Tensor:
         return self.E_beta(x)
+
+    def E_visible_gaussian(self, x: Tensor) -> Tensor:
+        std = self.visible_std
+        z = x / std
+        return 0.5 * z.square().sum(dim=1)
 
     def E_visible_field(self, x: Tensor) -> Tensor:
         return -x @ self.visible_field
@@ -509,29 +591,42 @@ class RBMEnergy(torch.nn.Module):
         return -torch.nn.functional.softplus(hidden_pre_activation).sum(dim=1)
 
     def E_beta(self, x: Tensor, beta: float = 1.0) -> Tensor:
-        return self.E_visible_field(x) + beta * self.E_nn(x)
+        return (
+            self.E_visible_gaussian(x)
+            + self.E_visible_field(x)
+            + beta * self.E_nn(x)
+        )
 
     @property
     def ref_log_z(self) -> Tensor:
-        """log Z for beta=0, i.e. independent Bernoulli visibles.
-
-        E_0(x) = -x^T a, x in {0, 1}^D
-
-        Z_0 = prod_i (1 + exp(a_i))
-        log Z_0 = sum_i softplus(a_i)
-        """
-        return torch.nn.functional.softplus(self.visible_field).sum()
-
-    def sample_independent(
-        self,
-        num_samples: int,
-    ) -> Tensor:
-        """Exact samples from beta=0 independent visible model."""
-        probs = torch.sigmoid(self.visible_field)
-        return torch.bernoulli(
-            probs.view(1, -1).expand(num_samples, -1)
+        std = self.visible_std
+        d = torch.as_tensor(
+            self.num_visibles,
+            device=std.device,
+            dtype=std.dtype,
+        )
+        log_two_pi = torch.log(
+            torch.as_tensor(2.0 * torch.pi, device=std.device, dtype=std.dtype)
+        )
+        return (
+            0.5 * d * log_two_pi
+            + torch.log(std).sum()
+            + 0.5 * (std * self.visible_field).square().sum()
         )
 
+    def sample_independent(self, num_samples: int) -> Tensor:
+        std = self.visible_std
+        mean = std.square() * self.visible_field
+
+        eps = torch.randn(
+            num_samples,
+            self.num_visibles,
+            device=std.device,
+            dtype=std.dtype,
+        )
+
+        return mean.view(1, -1) + std.view(1, -1) * eps
+    
 
 ENERGY_MAP: dict[str, type[torch.nn.Module]] = {
     "mlp": MLPEnergy,
@@ -576,8 +671,19 @@ def build_energy(
             hidden_dims = energy_kwargs.pop("hidden_dims", None)
             if hidden_dims is not None:
                 energy_kwargs["num_hiddens"] = int(hidden_dims[0])
-            for key in ("data_mean", "data_std", "base_std_floor"):
-                energy_kwargs.pop(key, None)
+
+            energy_kwargs.pop("data_mean", None)
+
+            data_std = energy_kwargs.pop("data_std", None)
+            base_std_floor = energy_kwargs.pop("base_std_floor", 1e-4)
+
+            if data_std is not None:
+                data_std = torch.clamp(data_std, min=base_std_floor)
+                energy_kwargs["log_visible_std"] = torch.log(torch.expm1(data_std))
+
+            energy_kwargs["min_std"] = base_std_floor
+
+            energy = RBMEnergy(num_visibles=num_visibles, **energy_kwargs)
         energy = ENERGY_MAP[energy_type](
             num_visibles=num_visibles,
             **energy_kwargs,
@@ -624,10 +730,8 @@ def identify_energy_type(named_params: dict[str, np.ndarray]) -> str:
             return "cnn"
         case keys if any(name.startswith("net.") for name in keys):
             return "mlp"
-        case keys if {"visible_field", "hidden_bias", "weight"} <= keys:
+        case keys if {"log_visible_std", "visible_field", "hidden_bias", "weight"} <= keys:
             return "rbm"
-        case keys if {"data_mean", "data_std"} <= keys:
-            return "gaussian"
         case _:
             raise ValueError(
                 "Could not identify continuous EBM energy type from saved parameters. "
@@ -635,17 +739,11 @@ def identify_energy_type(named_params: dict[str, np.ndarray]) -> str:
             )
 
 
-def restore_gaussian_energy(named_params: dict[str, np.ndarray]) -> GaussianBaseEnergy:
-    return GaussianBaseEnergy(
-        data_mean=torch.as_tensor(named_params["data_mean"]),
-        data_std=torch.as_tensor(named_params["data_std"]),
-    )
-
-
-def restore_rbm_energy(named_params: dict[str, np.ndarray]) -> RBMEnergy:
+def restore_rbm_energy(named_params):
     return RBMEnergy(
-        num_visibles=named_params["visible_field"].shape[0],
+        num_visibles=named_params["log_visible_std"].shape[0],
         num_hiddens=named_params["hidden_bias"].shape[0],
+        log_visible_std=torch.as_tensor(named_params["log_visible_std"]),
         visible_field=torch.as_tensor(named_params["visible_field"]),
         hidden_bias=torch.as_tensor(named_params["hidden_bias"]),
     )
@@ -667,8 +765,8 @@ def restore_mlp_energy(named_params: dict[str, np.ndarray]) -> MLPEnergy:
     return MLPEnergy(
         num_visibles=num_visibles,
         hidden_dims=hidden_dims,
-        data_mean=torch.as_tensor(named_params["base.data_mean"]),
-        data_std=torch.as_tensor(named_params["base.data_std"]),
+        data_mean=torch.as_tensor(named_params["data_mean"]),
+        data_std=torch.as_tensor(named_params["data_std"]),
         visible_field=torch.as_tensor(named_params["visible_field"]),
         output_bias=final_bias_key in named_params,
     )
@@ -718,9 +816,9 @@ def restore_cnn_energy(named_params: dict[str, np.ndarray]) -> CNNEnergy:
     else:
         image_shape = None
 
-    if "base.data_mean" in named_params:
-        data_mean = torch.as_tensor(named_params["base.data_mean"])
-        data_std = torch.as_tensor(named_params["base.data_std"])
+    if "data_mean" in named_params:
+        data_mean = torch.as_tensor(named_params["data_mean"])
+        data_std = torch.as_tensor(named_params["data_std"])
         num_visibles = data_mean.shape[0]
     elif image_shape is not None:
         data_mean = None

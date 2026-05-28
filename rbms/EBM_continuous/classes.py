@@ -7,14 +7,14 @@ import torch
 from torch import Tensor
 
 from rbms.classes import EBM
-from rbms.EBM_continuous.implement import _sample_state_hmc, _sample_state_nuts
+from rbms.EBM_continuous.implement import sample_state as sample_state_impl
 
 
 class _ModelEnergyProxy(torch.nn.Module):
     def __init__(self, model: "CEBM"):
         super().__init__()
         self.model = model
-        self.base = getattr(model.energy, "base", model.energy)
+        self.base = model.energy
 
     def forward(self, v: Tensor) -> Tensor:
         return self.model.compute_energy_visibles(v)
@@ -309,68 +309,30 @@ class CEBM(EBM):
         beta: float = 1.0,
         **kwargs,
     ) -> dict[str, Tensor]:
-        """Sample the model for n_steps.
-
-        Args:
-            chains: The starting position of the chains.
-            n_steps: The number of sampling steps.
-            beta: The inverse temperature. Defaults to 1.0.
-            kernel: The Markov kernel to use for sampling. Defaults to "hmc".
-            kernel_params: Parameters forwarded to the Markov kernel.
-
-        Returns:
-            The updated chains after n_steps of sampling.
-        """
-        kernel: str | None = kwargs.pop("kernel", None)
-        kernel_params: dict | None = kwargs.pop("kernel_params", {})
-
-        if kernel_params is None:
-            kernel_params = {}
+        """Sample visible chains with HMC."""
+        kernel_params = kwargs.pop("kernel_params", {}) or {}
         kernel_params = {**kernel_params, **kwargs}
 
-        if kernel is None:
-            kernel = "hmc"
+        sampled = sample_state_impl(
+            energy=_ModelEnergyProxy(self),
+            chains={
+                "visible": chains["visible"].detach().clone(),
+                "weights": chains["weights"].detach().clone(),
+            },
+            n_steps=n_steps,
+            sampler="hmc",
+            beta=beta,
+            **kernel_params,
+        )
 
-        new_chains = {
-            "visible": chains["visible"].clone(),
-            "weights": chains["weights"].clone(),
-        }
-
-        tempered_energy = _ModelEnergyProxy(self)
-
-        match kernel:
-            case "hmc":
-                sampled = _sample_state_hmc(
-                    energy=tempered_energy,
-                    chains=new_chains,
-                    n_steps=n_steps,
-                    beta=beta,
-                    **kernel_params,
-                )
-                self.last_acceptance = sampled.get("acceptance")
-                self.last_tree_depth = sampled.get("nuts_tree_depth")
-                self.last_step_size = sampled.get("step_size")
-                return sampled
-            case "nuts":
-                sampled = _sample_state_nuts(
-                    energy=tempered_energy,
-                    chains=new_chains,
-                    n_steps=n_steps,
-                    beta=beta,
-                    **kernel_params,
-                )
-                self.last_acceptance = sampled.get("acceptance")
-                self.last_tree_depth = sampled.get("nuts_tree_depth")
-                self.last_step_size = sampled.get("step_size")
-                return sampled
-            case _:
-                raise NotImplementedError(f"Unknown CEBM sampling kernel: {kernel}.")
+        self.last_acceptance = sampled.get("acceptance")
+        self.last_step_size = None
+        self.last_tree_depth = None
+        return sampled
 
     def get_metrics(self, metrics: dict[str, float]) -> dict[str, float]:
         if self.last_acceptance is not None:
             metrics["hmc_acceptance"] = float(self.last_acceptance.detach().cpu())
-        if self.last_tree_depth is not None:
-            metrics["nuts_tree_depth"] = float(self.last_tree_depth.detach().cpu())
         if self.last_step_size is not None:
             metrics["hmc_step_size"] = float(self.last_step_size.detach().cpu())
         return metrics
@@ -387,20 +349,31 @@ class CEBM(EBM):
 
     def compute_base_energy(self, v: Tensor) -> Tensor:
         v = v.to(device=self.device, dtype=self.dtype)
-        if not hasattr(self.energy, "E_gauss"):
-            return torch.zeros(v.shape[0], device=v.device, dtype=v.dtype)
-        return self.energy.E_gauss(v).view(-1)
+        if hasattr(self.energy, "E_visible_gaussian"):
+            return self.energy.E_visible_gaussian(v).view(-1)
+        if hasattr(self.energy, "E_gauss"):
+            return self.energy.E_gauss(v).view(-1)
+        return torch.zeros(v.shape[0], device=v.device, dtype=v.dtype)
 
     def compute_visible_field_energy(self, v: Tensor) -> Tensor:
         v = v.to(device=self.device, dtype=self.dtype)
-        return self.energy.E_visible_field(v).view(-1)
+        if hasattr(self.energy, "E_visible_field"):
+            return self.energy.E_visible_field(v).view(-1)
+        return torch.zeros(v.shape[0], device=v.device, dtype=v.dtype)
 
     def compute_neural_energy(self, v: Tensor) -> Tensor:
         v = v.to(device=self.device, dtype=self.dtype)
         return self.energy.E_nn(v).view(-1)
     
     def _get_visible_field(self) -> Tensor:
-        return self.energy.visible_field
+        if hasattr(self.energy, "visible_field"):
+            return self.energy.visible_field
+        return torch.zeros(self.num_visibles, device=self.device, dtype=self.dtype)
 
-    def _get_base_stats(self) -> tuple[Tensor, Tensor]:
-        return self.energy.base.data_mean, self.energy.base.data_std
+def _get_base_stats(self) -> tuple[Tensor, Tensor]:
+    if hasattr(self.energy, "data_mean"):
+        return self.energy.data_mean, self.energy.data_std
+    return (
+        torch.zeros(self.num_visibles, device=self.device, dtype=self.dtype),
+        self.energy.visible_std,
+    )

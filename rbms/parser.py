@@ -159,7 +159,7 @@ def add_sampling_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--sampling_kernel",
         type=str,
         default=None,
-        choices=["hmc", "nuts"],
+        choices=["hmc"],
         help="Sampling kernel for continuous EBMs. If omitted, defaults to HMC.",
     )
     sampling_args.add_argument(
