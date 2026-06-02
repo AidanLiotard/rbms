@@ -167,13 +167,13 @@ def _init_training(
             dtype=dtype,
         )
 
-    if hasattr(params.energy, "calibrate_final_layer"):
-        scale = params.energy.calibrate_final_layer(
-            data=train_dataset.data,
-            weights=train_dataset.weights,
-            target_std=0.05,
-        )
-        print(f"Calibrated final energy layer by scale factor {scale:.6g}")
+#    if hasattr(params.energy, "calibrate_final_layer"):
+#        scale = params.energy.calibrate_final_layer(
+#           data=train_dataset.data,
+#            weights=train_dataset.weights,
+#            target_std=0.05,
+#        )
+#        print(f"Calibrated final energy layer by scale factor {scale:.6g}")
 
     sampler_kernel = None
     sampler_kernel_params = {}

@@ -22,15 +22,17 @@ def _normalize_hidden_dims(
 
 def _init_mlp_layers(
     modules: torch.nn.Sequential,
+    spectral_scale: float = 0.1,
 ) -> None:
-    """Initialize MLP weights while keeping hidden biases neutral."""
+    """Initialize Linear layers with controlled singular-value scale."""
 
     for module in modules:
         if isinstance(module, torch.nn.Linear):
-            torch.nn.init.xavier_uniform_(module.weight)
+            torch.nn.init.orthogonal_(module.weight)
+            module.weight.data.mul_(spectral_scale)
+
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
-
 
 def _init_cnn_layers(*modules: torch.nn.Module) -> None:
     """Initialize CNN affine layers while keeping biases neutral."""
@@ -160,6 +162,7 @@ class MLPEnergy(torch.nn.Module):
         base_std_floor: float = 0.02,
         visible_field: Tensor | None = None,
         output_bias: bool = False,
+        init_spectral_scale: float = 0.1,
     ):
         super().__init__()
         self.num_visibles = int(num_visibles)
@@ -185,19 +188,21 @@ class MLPEnergy(torch.nn.Module):
 
         self.register_buffer("data_mean", data_mean.clone())
         self.register_buffer("data_std", data_std.clone().clamp_min(self.base_std_floor))
-        self.visible_field = torch.nn.Parameter(visible_field.clone())
+        self.visible_field = torch.nn.Parameter(visible_field.clone(), requires_grad=False)
 
         layers = []
         in_dim = num_visibles
         for out_dim in self.hidden_dims:
             layers.append(torch.nn.Linear(in_dim, out_dim))
+            layers[-1].requires_grad_(False)
             layers.append(torch.nn.SiLU())
             in_dim = out_dim
         layers.append(torch.nn.Linear(in_dim, 1, bias=output_bias))
+        layers[-1].requires_grad_(False)
 
         self.net = torch.nn.Sequential(*layers)
-        _init_mlp_layers(self.net)
-
+        _init_mlp_layers(self.net, spectral_scale=init_spectral_scale)
+        
     @property
     def visible_std(self) -> Tensor:
         return self.data_std
@@ -558,8 +563,8 @@ class RBMEnergy(torch.nn.Module):
 
         self.register_buffer("log_visible_std", log_visible_std.clone())
 
-        self.visible_field = torch.nn.Parameter(visible_field.clone())
-        self.hidden_bias = torch.nn.Parameter(hidden_bias.clone())
+        self.visible_field = torch.nn.Parameter(visible_field.clone(), requires_grad=False)
+        self.hidden_bias = torch.nn.Parameter(hidden_bias.clone(), requires_grad=False)
 
         self.weight = torch.nn.Parameter(
             weight_scale
@@ -568,7 +573,8 @@ class RBMEnergy(torch.nn.Module):
                 self.num_visibles,
                 device=log_visible_std.device,
                 dtype=log_visible_std.dtype,
-            )
+            ),
+            requires_grad=False,
         )
 
     @property

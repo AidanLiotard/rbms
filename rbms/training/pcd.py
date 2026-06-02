@@ -76,7 +76,7 @@ def train(
         flags = []
         flags = params.save_flags(flags)
         flags = sampler.save_flags(flags)
-        save_model_now = idx in model_checkpoints or idx == num_updates
+        save_model_now = idx in model_checkpoints or idx == num_updates or len(flags) > 0
         save_chains_now = idx in chain_checkpoints or idx == num_updates
         save_metrics_now = idx in metric_checkpoints or idx == num_updates
 

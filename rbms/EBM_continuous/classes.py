@@ -138,6 +138,9 @@ class CEBM(EBM):
         data_weights = w_data / w_data.sum()
         chain_weights = w_chain / w_chain.sum()
 
+        for p in self.energy.parameters():
+            p.requires_grad_(True)
+
         data_energy = self.compute_energy_visibles(v_data)
         chain_energy = self.compute_energy_visibles(v_chain)
 
@@ -147,6 +150,9 @@ class CEBM(EBM):
 
         self.energy.zero_grad(set_to_none=True)
         objective.backward()
+
+        for p in self.energy.parameters():
+            p.requires_grad_(False)
 
     def parameters(self) -> list[Tensor]:
         return list(self.energy.parameters())
@@ -313,7 +319,7 @@ class CEBM(EBM):
         kernel_params = kwargs.pop("kernel_params", {}) or {}
         kernel_params = {**kernel_params, **kwargs}
 
-        sampled = sample_state_impl(
+        chains, info = sample_state_impl(
             energy=_ModelEnergyProxy(self),
             chains={
                 "visible": chains["visible"].detach().clone(),
@@ -325,10 +331,10 @@ class CEBM(EBM):
             **kernel_params,
         )
 
-        self.last_acceptance = sampled.get("acceptance")
+        self.last_acceptance = info.get("acceptance")
         self.last_step_size = None
         self.last_tree_depth = None
-        return sampled
+        return chains
 
     def get_metrics(self, metrics: dict[str, float]) -> dict[str, float]:
         if self.last_acceptance is not None:
