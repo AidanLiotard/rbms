@@ -1,5 +1,6 @@
 from __future__ import annotations
  
+import math
 import torch
 from torch import Tensor
 
@@ -109,6 +110,124 @@ def _sample_state_hmc(
     return sampled, info
 
 
+def _sample_state_hmc_adapt(
+    energy: torch.nn.Module,
+    chains: dict[str, Tensor],
+    n_steps: int,
+    beta: float = 1.0,
+    step_size: float = 1e-2,
+    num_leapfrog_steps: int = 10,
+    mass: float | Tensor | None = None,
+    target_acceptance: float = 0.75,
+    adapt_step_size: bool = True,
+    adapt_rate: float = 0.3,
+    min_step_size: float = 1e-5,
+    max_step_size: float = 5.0,
+    step_size_target: float | None = None,
+    step_size_rate: float | None = None,
+    step_size_warmup: int | None = None,
+    **_,
+) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
+    """Adaptive HMC for p(x) proportional to exp(-beta E(x))."""
+
+    # Compatibility with CLI/kernel_params names.
+    if step_size_target is not None:
+        target_acceptance = float(step_size_target)
+
+    if step_size_rate is not None:
+        adapt_rate = float(step_size_rate)
+
+    visible = chains["visible"].detach().clone()
+    weights = chains.get("weights", None)
+
+    # Optional compatibility if some caller stores step_size in chains.
+    if "step_size" in chains:
+        step_size = float(chains["step_size"].detach().cpu().item())
+
+    # Clip after every possible source of step_size has been resolved.
+    step_size = min(max(float(step_size), min_step_size), max_step_size)
+
+    mass_tensor = _resolve_mass(energy=energy, visible=visible, mass=mass)
+    inv_mass = 1.0 / mass_tensor.view(1, -1)
+    momentum_std = mass_tensor.sqrt().view(1, -1)
+
+    acceptances = []
+
+    for _ in range(n_steps):
+        start_visible = visible.detach()
+        start_momentum = momentum_std * torch.randn_like(start_visible)
+
+        current_energy, grad = _energy_and_grad(
+            energy=energy,
+            visible=start_visible,
+            beta=beta,
+        )
+        current_kinetic = _kinetic_energy(start_momentum, mass_tensor)
+
+        proposal_visible = start_visible
+        proposal_momentum = start_momentum - 0.5 * step_size * grad
+
+        for leapfrog_step in range(num_leapfrog_steps):
+            proposal_visible = proposal_visible + step_size * proposal_momentum * inv_mass
+            proposed_energy, grad = _energy_and_grad(
+                energy=energy,
+                visible=proposal_visible,
+                beta=beta,
+            )
+
+            if leapfrog_step != num_leapfrog_steps - 1:
+                proposal_momentum = proposal_momentum - step_size * grad
+
+        proposal_momentum = proposal_momentum - 0.5 * step_size * grad
+        proposal_momentum = -proposal_momentum
+
+        proposed_kinetic = _kinetic_energy(proposal_momentum, mass_tensor)
+
+        log_acceptance = (
+            -proposed_energy
+            - proposed_kinetic
+            + current_energy
+            + current_kinetic
+        )
+
+        with torch.no_grad():
+            accept = torch.log(torch.rand_like(log_acceptance)) < log_acceptance
+            visible = torch.where(
+                accept[:, None],
+                proposal_visible.detach(),
+                start_visible,
+            )
+            acceptances.append(accept.float().mean())
+
+    mean_acceptance = torch.stack(acceptances).mean()
+
+    if adapt_step_size:
+        step_size *= math.exp(
+            adapt_rate * (float(mean_acceptance.item()) - target_acceptance)
+        )
+        step_size = min(max(step_size, min_step_size), max_step_size)
+
+    sampled = {
+        "visible": visible.detach(),
+        "visible_mag": visible.detach(),
+    }
+
+    if weights is not None:
+        sampled["weights"] = weights
+
+    info = {
+        "acceptance": mean_acceptance,
+        "step_size": torch.tensor(
+            step_size,
+            device=visible.device,
+            dtype=visible.dtype,
+        ),
+    }
+
+    torch.cuda.empty_cache()
+    return sampled, info
+
+
 def _sample_state_mala(
     energy: torch.nn.Module,
     chains: dict[str, Tensor],
@@ -197,9 +316,9 @@ def sample_state(
     step_size: float = 1e-2,
     num_leapfrog_steps: int = 10,
     mass: float | Tensor | None = None,
-    **_,
+    **kwargs,
 ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
-    """Sampler dispatch.."""
+    """Sampler dispatch."""
 
     if sampler == "hmc":
         return _sample_state_hmc(
@@ -210,13 +329,29 @@ def sample_state(
             step_size=step_size,
             num_leapfrog_steps=num_leapfrog_steps,
             mass=mass,
+            **kwargs,
         )
 
-    elif sampler == "mala":
+    if sampler == "hmc_adapt":
+        return _sample_state_hmc_adapt(
+            energy=energy,
+            chains=chains,
+            n_steps=n_steps,
+            beta=beta,
+            step_size=step_size,
+            num_leapfrog_steps=num_leapfrog_steps,
+            mass=mass,
+            **kwargs,
+        )
+
+    if sampler == "mala":
         return _sample_state_mala(
             energy=energy,
             chains=chains,
             n_steps=n_steps,
             beta=beta,
             step_size=step_size,
+            **kwargs,
         )
+
+    raise ValueError(f"Unknown sampler: {sampler!r}")

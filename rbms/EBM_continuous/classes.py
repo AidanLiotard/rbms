@@ -315,26 +315,30 @@ class CEBM(EBM):
         beta: float = 1.0,
         **kwargs,
     ) -> dict[str, Tensor]:
-        """Sample visible chains with HMC."""
+        """Sample visible chains with adaptive HMC."""
         kernel_params = kwargs.pop("kernel_params", {}) or {}
         kernel_params = {**kernel_params, **kwargs}
 
-        chains, info = sample_state_impl(
+        if self.last_step_size is not None:
+            kernel_params["step_size"] = float(self.last_step_size.detach().cpu())
+
+        sampled_chains, info = sample_state_impl(
             energy=_ModelEnergyProxy(self),
             chains={
                 "visible": chains["visible"].detach().clone(),
                 "weights": chains["weights"].detach().clone(),
             },
             n_steps=n_steps,
-            sampler="hmc",
+            sampler="hmc_adapt",
             beta=beta,
             **kernel_params,
         )
 
         self.last_acceptance = info.get("acceptance")
-        self.last_step_size = None
+        self.last_step_size = info.get("step_size")
         self.last_tree_depth = None
-        return chains
+
+        return sampled_chains
 
     def get_metrics(self, metrics: dict[str, float]) -> dict[str, float]:
         if self.last_acceptance is not None:
