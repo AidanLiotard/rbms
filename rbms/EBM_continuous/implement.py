@@ -116,18 +116,18 @@ def _sample_state_hmc_adapt(
     n_steps: int,
     beta: float = 1.0,
     step_size: float = 1e-2,
-    num_leapfrog_steps: int = 10,
+    num_leapfrog_steps: int = 3,
     mass: float | Tensor | None = None,
-    target_acceptance: float = 0.75,
+    target_acceptance: float = 0.65,
     adapt_step_size: bool = True,
-    adapt_rate: float = 0.3,
+    adapt_rate: float = 0.05,
     min_step_size: float = 1e-5,
-    max_step_size: float = 5.0,
+    max_step_size: float = 0.2,
     step_size_target: float | None = None,
     step_size_rate: float | None = None,
     step_size_warmup: int | None = None,
     **_,
-) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
+):
     """Adaptive HMC for p(x) proportional to exp(-beta E(x))."""
 
     # Compatibility with CLI/kernel_params names.

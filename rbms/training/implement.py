@@ -80,8 +80,11 @@ def _init_training(
 
     # Setup model
     if hidden_dims is None:
-        hidden_dims = [num_hiddens]
-
+        if model_type == "CEBM" and energy_type == "cnn":
+            hidden_dims = [6, 16, 120, 84]
+        else:
+            hidden_dims = [num_hiddens]
+            
     if model_type == "BEBM":
         visible_field = get_visible_field_from_data(
             data=train_dataset.data,

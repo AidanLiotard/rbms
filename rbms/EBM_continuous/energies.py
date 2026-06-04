@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-from torch import Tensor 
+from torch import Tensor
 
 
 def _normalize_hidden_dims(
@@ -33,6 +33,7 @@ def _init_mlp_layers(
 
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
+
 
 def _init_cnn_layers(*modules: torch.nn.Module) -> None:
     """Initialize CNN affine layers while keeping biases neutral."""
@@ -151,6 +152,7 @@ def _rescale_final_linear_to_target_std(
 
 class MLPEnergy(torch.nn.Module):
     """Continuous visible-state energy: Gaussian base + visible field + MLP residual."""
+
     def __init__(
         self,
         num_visibles: int,
@@ -202,7 +204,7 @@ class MLPEnergy(torch.nn.Module):
 
         self.net = torch.nn.Sequential(*layers)
         _init_mlp_layers(self.net, spectral_scale=init_spectral_scale)
-        
+
     @property
     def visible_std(self) -> Tensor:
         return self.data_std
@@ -266,266 +268,153 @@ class MLPEnergy(torch.nn.Module):
 
 
 class CNNEnergy(torch.nn.Module):
-    """Continuous flattened-image energy: Gaussian base + visible field + CNN residual."""
+    """Continuous image energy: Gaussian base + visible field + LeNet CNN residual."""
 
     def __init__(
         self,
         num_visibles: int,
-        hidden_dims: list[int] | tuple[int, ...] | None = None,
-        hidden_dim: int = 32,
-        num_layers: int = 2,
-        image_shape: tuple[int, int] | list[int] | None = None,
-        kernel_size: int = 3,
         data_mean: Tensor | None = None,
         data_std: Tensor | None = None,
-        base_std_floor: float = 0.02,
+        base_std_floor: float = 0.05,
         visible_field: Tensor | None = None,
+        image_shape: tuple[int, int, int] = (1, 28, 28),
+        hidden_dim: int = 84,
         output_bias: bool = False,
-        architecture: str = "residual",
     ):
         super().__init__()
-
         self.num_visibles = int(num_visibles)
-        self.architecture = architecture
-        self.hidden_dims = _normalize_hidden_dims(
-            hidden_dims=hidden_dims,
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
-        )
-        self.hidden_dim = self.hidden_dims[-1]
-        self.num_layers = len(self.hidden_dims)
-        self.kernel_size = int(kernel_size)
+        self.image_shape = tuple(image_shape)
         self.base_std_floor = float(base_std_floor)
 
-        if self.kernel_size <= 0 or self.kernel_size % 2 == 0:
-            raise ValueError(f"kernel_size must be a positive odd integer, got {kernel_size}.")
-
-        if image_shape is None:
-            image_shape = _infer_square_image_shape(self.num_visibles)
-
-        image_shape = tuple(int(dim) for dim in image_shape)
-
-        if len(image_shape) != 2 or any(dim <= 0 for dim in image_shape):
-            raise ValueError(f"image_shape must be a positive (height, width), got {image_shape}.")
-
-        if image_shape[0] * image_shape[1] != self.num_visibles:
+        c, h, w = self.image_shape
+        if self.num_visibles != c * h * w:
             raise ValueError(
-                f"image_shape={image_shape} is incompatible with "
-                f"num_visibles={self.num_visibles}."
+                f"num_visibles={self.num_visibles} incompatible with image_shape={self.image_shape}"
             )
 
-        self.image_shape = image_shape
-        self.register_buffer("_image_shape", torch.tensor(image_shape, dtype=torch.int64))
+        if (h, w) != (28, 28):
+            raise ValueError(
+                f"LeNet CNNEnergy currently expects 28x28 images, got {(h, w)}."
+            )
 
         if data_mean is None:
             data_mean = torch.zeros(self.num_visibles)
 
+        data_mean = torch.as_tensor(data_mean).flatten()
+        device = data_mean.device
+        dtype = data_mean.dtype
+
         if data_std is None:
-            data_std = torch.ones(self.num_visibles)
+            data_std = torch.ones(self.num_visibles, device=device, dtype=dtype)
+        else:
+            data_std = torch.as_tensor(data_std, device=device, dtype=dtype).flatten()
 
         if visible_field is None:
-            visible_field = torch.zeros(
-                self.num_visibles,
-                device=data_mean.device,
-                dtype=data_mean.dtype,
-            )
-
-        self.register_buffer("data_mean", data_mean.clone())
-        self.register_buffer("data_std", data_std.clone().clamp_min(self.base_std_floor))
-
-        self.visible_field = torch.nn.Parameter(visible_field.clone())
-
-        if architecture == "legacy":
-            conv_layers = []
-            in_channels = 1
-
-            for out_channels in self.hidden_dims:
-                conv_layers.append(
-                    torch.nn.Conv2d(
-                        in_channels,
-                        out_channels,
-                        kernel_size=self.kernel_size,
-                        padding=self.kernel_size // 2,
-                    )
-                )
-                conv_layers.append(torch.nn.SiLU())
-                in_channels = out_channels
-
-            self.conv = torch.nn.Sequential(*conv_layers)
-            self.pool = torch.nn.AdaptiveAvgPool2d(output_size=1)
-            self.head = torch.nn.Linear(in_channels, 1, bias=output_bias)
-
-            _init_cnn_layers(self.conv, self.head)
-
+            visible_field = torch.zeros(self.num_visibles, device=device, dtype=dtype)
         else:
-            self.stem = torch.nn.Conv2d(
-                1,
-                self.hidden_dims[0],
-                kernel_size=self.kernel_size,
-                padding=self.kernel_size // 2,
+            visible_field = torch.as_tensor(
+                visible_field,
+                device=device,
+                dtype=dtype,
+            ).flatten()
+
+        data_std = data_std.clamp_min(self.base_std_floor)
+
+        self.register_buffer("data_mean", data_mean)
+        self.register_buffer("data_std", data_std)
+        self.register_buffer("visible_field", visible_field)
+
+        # LeNet-style residual energy network:
+        # 1x28x28 -> 6x24x24 -> 6x12x12 -> 16x8x8 -> 16x4x4
+        self.net = torch.nn.Sequential(
+            torch.nn.Conv2d(c, 6, kernel_size=5, padding=0),
+            torch.nn.SiLU(),
+            torch.nn.AvgPool2d(kernel_size=2, stride=2),
+
+            torch.nn.Conv2d(6, 16, kernel_size=5, padding=0),
+            torch.nn.SiLU(),
+            torch.nn.AvgPool2d(kernel_size=2, stride=2),
+
+            torch.nn.Flatten(),
+
+            torch.nn.Linear(16 * 4 * 4, 120),
+            torch.nn.SiLU(),
+
+            torch.nn.Linear(120, hidden_dim),
+            torch.nn.SiLU(),
+
+            torch.nn.Linear(hidden_dim, 1, bias=output_bias),
+        )
+
+        self.net.requires_grad_(False)
+        self._init_weights()
+
+        log_two_pi = torch.log(
+            torch.as_tensor(
+                2.0 * torch.pi,
+                device=self.data_std.device,
+                dtype=self.data_std.dtype,
             )
+        )
 
-            blocks = []
-            in_channels = self.hidden_dims[0]
+        log_z_gauss = (
+            0.5 * self.num_visibles * log_two_pi
+            + torch.log(self.data_std).sum()
+        )
 
-            for idx, out_channels in enumerate(self.hidden_dims):
-                blocks.append(
-                    _ResidualDownsampleBlock(
-                        in_channels=in_channels,
-                        out_channels=out_channels,
-                        kernel_size=self.kernel_size,
-                        downsample=idx < len(self.hidden_dims) - 1,
-                    )
-                )
-                in_channels = out_channels
+        field_shift = torch.dot(self.visible_field, self.data_mean) + 0.5 * (
+            self.data_std * self.visible_field
+        ).square().sum()
 
-            self.blocks = torch.nn.ModuleList(blocks)
+        self.register_buffer("ref_log_z", log_z_gauss + field_shift)
 
-            with torch.no_grad():
-                dummy = torch.zeros(1, 1, *self.image_shape)
-                dummy_features = self.stem(dummy)
+    def _init_weights(self) -> None:
+        for module in self.net.modules():
+            if isinstance(module, torch.nn.Conv2d):
+                torch.nn.init.xavier_uniform_(module.weight, gain=0.5)
+                if module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
 
-                for block in self.blocks:
-                    dummy_features = block(dummy_features)
+            elif isinstance(module, torch.nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight, gain=0.5)
+                if module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
 
-                flattened_dim = dummy_features.flatten(start_dim=1).shape[1]
-
-            head_layers: list[torch.nn.Module] = []
-            head_hidden_dims = self.hidden_dims[1:] or [self.hidden_dims[0]]
-            head_in_dim = flattened_dim
-
-            for head_out_dim in head_hidden_dims:
-                head_layers.append(torch.nn.Linear(head_in_dim, head_out_dim))
-                head_layers.append(torch.nn.SiLU())
-                head_in_dim = head_out_dim
-
-            head_layers.append(torch.nn.Linear(head_in_dim, 1, bias=output_bias))
-
-            self.head = torch.nn.Sequential(*head_layers)
-
-            _init_cnn_layers(self.stem, self.blocks, self.head)
-
-    @property
-    def visible_std(self) -> Tensor:
-        return self.data_std
-
-    def _score(self, x: Tensor) -> Tensor:
-        image = x.view(x.shape[0], 1, *self.image_shape)
-
-        if self.architecture == "legacy":
-            features = self.pool(self.conv(image)).flatten(start_dim=1)
-        else:
-            features = self.stem(image)
-
-            for block in self.blocks:
-                features = block(features)
-
-            features = features.flatten(start_dim=1)
-
-        return self.head(features).view(-1)
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.E_beta(x)
-
-    def E_visible_gaussian(self, x: Tensor) -> Tensor:
-        z = (x - self.data_mean) / self.data_std
+    def E_visible_gaussian(self, v: Tensor) -> Tensor:
+        z = (v - self.data_mean.view(1, -1)) / self.data_std.view(1, -1)
         return 0.5 * z.square().sum(dim=1)
 
-    def E_gauss(self, x: Tensor) -> Tensor:
-        return self.E_visible_gaussian(x)
+    def E_visible_field(self, v: Tensor) -> Tensor:
+        return -(v * self.visible_field.view(1, -1)).sum(dim=1)
 
-    def E_visible_field(self, x: Tensor) -> Tensor:
-        return -x @ self.visible_field
+    def E_nn(self, v: Tensor) -> Tensor:
+        x = v.view(v.shape[0], *self.image_shape)
+        return self.net(x).view(-1)
 
-    def E_nn(self, x: Tensor) -> Tensor:
-        return self._score(x)
-
-    def E_beta(self, x: Tensor, beta: float = 1.0) -> Tensor:
+    def E_beta(self, v: Tensor, beta: float = 1.0) -> Tensor:
         return (
-            self.E_visible_gaussian(x)
-            + self.E_visible_field(x)
-            + beta * self.E_nn(x)
+            self.E_visible_gaussian(v)
+            + self.E_visible_field(v)
+            + beta * self.E_nn(v)
         )
 
-    @property
-    def ref_log_z(self) -> Tensor:
-        std = self.data_std
-        log_two_pi = torch.log(
-            torch.as_tensor(2.0 * torch.pi, device=std.device, dtype=std.dtype)
-        )
-        log_z_gauss = 0.5 * self.num_visibles * log_two_pi + torch.log(std).sum()
-        field_shift = torch.dot(self.visible_field, self.data_mean) + 0.5 * (
-            std * self.visible_field
-        ).square().sum()
-        return log_z_gauss + field_shift
+    def forward(self, v: Tensor) -> Tensor:
+        return self.E_beta(v, beta=1.0)
 
+    @torch.no_grad()
     def sample_independent(self, num_samples: int) -> Tensor:
-        std = self.data_std
-        mean = self.data_mean + std.square() * self.visible_field
-
-        eps = torch.randn(
+        mean = self.data_mean + self.data_std.square() * self.visible_field
+        return mean.view(1, -1) + self.data_std.view(1, -1) * torch.randn(
             num_samples,
             self.num_visibles,
-            device=std.device,
-            dtype=std.dtype,
+            device=self.data_mean.device,
+            dtype=self.data_mean.dtype,
         )
 
-        return mean.view(1, -1) + std.view(1, -1) * eps
-
-    def calibrate_final_layer(
-        self,
-        data: Tensor,
-        weights: Tensor | None = None,
-        target_std: float = 0.05,
-        batch_size: int = 4096,
-        eps: float = 1e-12,
-    ) -> float:
-        linear_layers = [
-            module for module in self.head.modules()
-            if isinstance(module, torch.nn.Linear)
-        ]
-        final_layer = linear_layers[-1]
-        device = final_layer.weight.device
-        dtype = final_layer.weight.dtype
-
-        data = data.to(device=device, dtype=dtype)
-
-        if weights is not None:
-            weights = weights.to(device=device, dtype=dtype).view(-1)
-
-        outputs = []
-        weight_chunks = []
-
-        with torch.no_grad():
-            for start in range(0, data.shape[0], batch_size):
-                stop = min(start + batch_size, data.shape[0])
-                outputs.append(self._score(data[start:stop]))
-
-                if weights is not None:
-                    weight_chunks.append(weights[start:stop])
-
-            values = torch.cat(outputs)
-
-            if weights is None:
-                current_std = values.std(unbiased=False)
-            else:
-                sample_weights = torch.cat(weight_chunks)
-                norm_weights = sample_weights / sample_weights.sum()
-                mean = (values * norm_weights).sum()
-                current_std = ((values - mean).square() * norm_weights).sum().sqrt()
-
-            if torch.isfinite(current_std) and current_std > eps:
-                scale = torch.as_tensor(target_std, device=device, dtype=dtype) / current_std
-                final_layer.weight.mul_(scale)
-                return float(scale.detach().cpu())
-
-        return 1.0
-    
 
 @torch.compile
 class RBMEnergy(torch.nn.Module):
-    """Fixed-variance Gaussian-visible / Bernoulli-hidden RBM.
-    """
+    """Fixed-variance Gaussian-visible / Bernoulli-hidden RBM."""
 
     def __init__(
         self,
@@ -632,7 +521,7 @@ class RBMEnergy(torch.nn.Module):
         )
 
         return mean.view(1, -1) + std.view(1, -1) * eps
-    
+
 
 ENERGY_MAP: dict[str, type[torch.nn.Module]] = {
     "mlp": MLPEnergy,
@@ -672,28 +561,61 @@ def build_energy(
             f"Unknown continuous EBM energy type '{energy_type}'. "
             f"Available energy types: {list(ENERGY_MAP.keys())}."
         )
-    else:
-        if energy_type == "rbm":
-            hidden_dims = energy_kwargs.pop("hidden_dims", None)
-            if hidden_dims is not None:
-                energy_kwargs["num_hiddens"] = int(hidden_dims[0])
 
-            energy_kwargs.pop("data_mean", None)
+    if energy_type == "rbm":
+        hidden_dims = energy_kwargs.pop("hidden_dims", None)
+        if hidden_dims is not None:
+            energy_kwargs["num_hiddens"] = int(hidden_dims[0])
 
-            data_std = energy_kwargs.pop("data_std", None)
-            base_std_floor = energy_kwargs.pop("base_std_floor", 1e-4)
+        energy_kwargs.pop("data_mean", None)
 
-            if data_std is not None:
-                data_std = torch.clamp(data_std, min=base_std_floor)
-                energy_kwargs["log_visible_std"] = torch.log(torch.expm1(data_std))
+        data_std = energy_kwargs.pop("data_std", None)
+        base_std_floor = energy_kwargs.pop("base_std_floor", 1e-4)
 
-            energy_kwargs["min_std"] = base_std_floor
+        if data_std is not None:
+            data_std = torch.clamp(data_std, min=base_std_floor)
+            energy_kwargs["log_visible_std"] = torch.log(torch.expm1(data_std))
 
-            energy = RBMEnergy(num_visibles=num_visibles, **energy_kwargs)
+        energy_kwargs["min_std"] = base_std_floor
+
+        energy = RBMEnergy(
+            num_visibles=num_visibles,
+            **energy_kwargs,
+        )
+
+    elif energy_type == "cnn":
+        hidden_dims = energy_kwargs.pop("hidden_dims", None)
+
+        # For LeNet CNNEnergy, hidden_dims is not used as conv channels.
+        # It is only accepted as a compatibility/checking argument.
+        if hidden_dims is not None:
+            hidden_dims = [int(x) for x in hidden_dims]
+            if hidden_dims not in ([6, 16], [6, 16, 120], [6, 16, 120, 84]):
+                raise ValueError(
+                    "LeNet CNNEnergy does not use arbitrary hidden_dims. "
+                    "Use one of: [6, 16], [6, 16, 120], [6, 16, 120, 84], "
+                    f"or omit hidden_dims. Got hidden_dims={hidden_dims}."
+                )
+
+        energy_kwargs.setdefault("image_shape", (1, 28, 28))
+
+        if num_visibles != 1 * 28 * 28:
+            raise ValueError(
+                f"LeNet CNNEnergy with image_shape=(1, 28, 28) expects "
+                f"num_visibles=784, got {num_visibles}."
+            )
+
         energy = ENERGY_MAP[energy_type](
             num_visibles=num_visibles,
             **energy_kwargs,
         )
+
+    else:
+        energy = ENERGY_MAP[energy_type](
+            num_visibles=num_visibles,
+            **energy_kwargs,
+        )
+
     return energy.to(device=device, dtype=dtype)
 
 
@@ -728,21 +650,37 @@ def restore_energy(
 def identify_energy_type(named_params: dict[str, np.ndarray]) -> str:
     keys = set(named_params)
 
-    match keys:
-        case keys if any(
-            name.startswith("conv.") or name.startswith("stem.") or name.startswith("blocks.")
-            for name in keys
-        ):
-            return "cnn"
-        case keys if any(name.startswith("net.") for name in keys):
-            return "mlp"
-        case keys if {"log_visible_std", "visible_field", "hidden_bias", "weight"} <= keys:
-            return "rbm"
-        case _:
-            raise ValueError(
-                "Could not identify continuous EBM energy type from saved parameters. "
-                f"Available keys: {list(named_params.keys())}."
-            )
+    # RBM first: very distinctive keys.
+    if {"log_visible_std", "visible_field", "hidden_bias", "weight"} <= keys:
+        return "rbm"
+
+    # Current CNNEnergy uses net.* keys, same prefix as MLPEnergy.
+    # Distinguish by Conv2d weights, which are 4D tensors.
+    if any(
+        name.startswith("net.")
+        and name.endswith(".weight")
+        and getattr(named_params[name], "ndim", None) == 4
+        for name in keys
+    ):
+        return "cnn"
+
+    # Legacy CNN variants, if any.
+    if any(
+        name.startswith("conv.")
+        or name.startswith("stem.")
+        or name.startswith("blocks.")
+        for name in keys
+    ):
+        return "cnn"
+
+    # MLP has net.* weights, but all Linear weights are 2D.
+    if any(name.startswith("net.") for name in keys):
+        return "mlp"
+
+    raise ValueError(
+        "Could not identify continuous EBM energy type from saved parameters. "
+        f"Available keys: {list(named_params.keys())}."
+    )
 
 
 def restore_rbm_energy(named_params):
@@ -779,68 +717,48 @@ def restore_mlp_energy(named_params: dict[str, np.ndarray]) -> MLPEnergy:
 
 
 def restore_cnn_energy(named_params: dict[str, np.ndarray]) -> CNNEnergy:
-    legacy_conv_weight_keys = sorted(
+    if "data_mean" not in named_params or "data_std" not in named_params:
+        raise ValueError("Cannot restore CNNEnergy without data_mean and data_std.")
+
+    data_mean = torch.as_tensor(named_params["data_mean"])
+    data_std = torch.as_tensor(named_params["data_std"])
+    num_visibles = data_mean.shape[0]
+
+    if num_visibles == 784:
+        image_shape = (1, 28, 28)
+    else:
+        side = int(num_visibles**0.5)
+        if side * side != num_visibles:
+            raise ValueError(
+                "Cannot infer image_shape for CNNEnergy restore from "
+                f"num_visibles={num_visibles}."
+            )
+        image_shape = (1, side, side)
+
+    # Current architecture has final hidden layer Linear(..., hidden_dim),
+    # so infer hidden_dim from the penultimate Linear weight if possible.
+    linear_weight_keys = sorted(
         [
             name
             for name in named_params
-            if name.startswith("conv.") and name.endswith(".weight")
+            if name.startswith("net.")
+            and name.endswith(".weight")
+            and named_params[name].ndim == 2
         ],
         key=lambda name: int(name.split(".")[1]),
     )
-    new_block_weight_keys = sorted(
-        [
-            name
-            for name in named_params
-            if name.startswith("blocks.") and name.endswith("main.0.weight")
-        ],
-        key=lambda name: int(name.split(".")[1]),
-    )
-    if len(new_block_weight_keys) > 0:
-        channels = [named_params[key].shape[0] for key in new_block_weight_keys]
-        kernel_size = named_params[new_block_weight_keys[0]].shape[-1]
-        architecture = "residual"
-        head_weight_keys = sorted(
-            [
-                name
-                for name in named_params
-                if name.startswith("head.") and name.endswith(".weight")
-            ],
-            key=lambda name: int(name.split(".")[1]),
-        )
-        final_head_bias = head_weight_keys[-1].replace(".weight", ".bias")
-        output_bias = final_head_bias in named_params
-    elif len(legacy_conv_weight_keys) > 0:
-        channels = [named_params[key].shape[0] for key in legacy_conv_weight_keys]
-        kernel_size = named_params[legacy_conv_weight_keys[0]].shape[-1]
-        architecture = "legacy"
-        output_bias = "head.bias" in named_params
-    else:
-        raise ValueError("Cannot restore CNNEnergy without convolution weight tensors.")
 
-    if "_image_shape" in named_params:
-        image_shape = tuple(int(dim) for dim in named_params["_image_shape"])
+    if len(linear_weight_keys) >= 2:
+        hidden_dim = named_params[linear_weight_keys[-2]].shape[0]
     else:
-        image_shape = None
-
-    if "data_mean" in named_params:
-        data_mean = torch.as_tensor(named_params["data_mean"])
-        data_std = torch.as_tensor(named_params["data_std"])
-        num_visibles = data_mean.shape[0]
-    elif image_shape is not None:
-        data_mean = None
-        data_std = None
-        num_visibles = image_shape[0] * image_shape[1]
-    else:
-        raise ValueError("Cannot restore CNNEnergy without base stats or saved image shape.")
+        hidden_dim = 84
 
     return CNNEnergy(
         num_visibles=num_visibles,
-        hidden_dims=channels,
         image_shape=image_shape,
-        kernel_size=kernel_size,
         data_mean=data_mean,
         data_std=data_std,
         visible_field=torch.as_tensor(named_params["visible_field"]),
-        output_bias=output_bias,
-        architecture=architecture,
+        hidden_dim=hidden_dim,
+        output_bias="net.17.bias" in named_params,
     )
